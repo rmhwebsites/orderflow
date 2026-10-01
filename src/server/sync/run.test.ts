@@ -8,6 +8,7 @@ import { and, eq, inArray, lt } from "drizzle-orm";
 import type { Db } from "../../db";
 import * as schema from "../../db/schema";
 import { encryptSecret } from "../crypto";
+import { MAX_PAGES, ORDERS_PER_PAGE } from "../shopify/client";
 import fixture from "../shopify/__fixtures__/orders-graphql.json";
 import { runSync, applyPair, EXISTENCE_CHUNK, type SyncResult } from "./run";
 import { runAllSyncs } from "./cron";
@@ -47,11 +48,14 @@ const rileyNode = {
   lineItems: { nodes: [] },
 };
 
-function openDb() {
+// opts.through stops at a migration number ("0003"), for the test that pins
+// which schema the sync engine needs.
+function openDb(opts?: { through?: string }) {
   const raw = new Database(":memory:");
   raw.pragma("foreign_keys = ON");
   const files = readdirSync(migrationsDir)
     .filter((f) => f.endsWith(".sql"))
+    .filter((f) => opts?.through === undefined || f.slice(0, 4) <= opts.through)
     .sort();
   for (const file of files) {
     const sql = readFileSync(join(migrationsDir, file), "utf8");
@@ -169,17 +173,41 @@ function errorsFetch(errors: unknown[]) {
 
 type SimOrder = { idNum: number; updatedAtMs: number };
 
+type SimRequest = { query: string; variables: { cursor: string | null; search: string } };
+
+function simRequest(init?: RequestInit): SimRequest {
+  return JSON.parse(String(init?.body ?? "{}")) as SimRequest;
+}
+
+// The simulators serve the page size the query asks for, read from the query
+// document itself, so a run sees the same number of pages it would see live.
+function requestedPageSize(request: SimRequest): number {
+  const size = request.query.match(/orders\(first: (\d+)/);
+  if (!size) {
+    throw new Error("simulator: the query names no orders page size");
+  }
+  return Number(size[1]);
+}
+
+// The value a truncated run leaves in store_connections.sync_cursor: the run
+// start of the tick that opened the cursor chain, then the Shopify cursor.
+// Spelled out here, not imported from run.ts, so the tests pin the stored
+// format as well.
+function chainToken(openedAt: number, cursor: string): string {
+  return `${openedAt}|${cursor}`;
+}
+
 // Window-honoring Shopify simulator (adapted from the review repro harness):
 // filters the dataset by the updated_at search window, sorts ascending by
-// (updated_at, id) like the Admin API's stable tie-break, pages 50 at a time,
-// and optionally rejects any cursor to simulate staleness.
+// (updated_at, id) like the Admin API's stable tie-break, pages by the
+// requested page size, and optionally rejects any cursor to simulate
+// staleness.
 function shopifySim(dataset: SimOrder[], opts?: { rejectCursors?: boolean }) {
   let requests = 0;
   const impl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
     requests++;
-    const vars = (JSON.parse(String(init?.body ?? "{}")) as {
-      variables: { cursor: string | null; search: string };
-    }).variables;
+    const request = simRequest(init);
+    const vars = request.variables;
     if (vars.cursor !== null && opts?.rejectCursors) {
       return new Response(
         JSON.stringify({ errors: [{ message: `cursor ${vars.cursor} is invalid` }] }),
@@ -191,7 +219,7 @@ function shopifySim(dataset: SimOrder[], opts?: { rejectCursors?: boolean }) {
       .filter((o) => o.updatedAtMs >= sinceMs)
       .sort((a, b) => a.updatedAtMs - b.updatedAtMs || a.idNum - b.idNum);
     const start = vars.cursor ? parseInt(vars.cursor.slice(4), 10) : 0;
-    const page = windowed.slice(start, start + 50);
+    const page = windowed.slice(start, start + requestedPageSize(request));
     const end = start + page.length;
     const nodes = page.map((o) => ({
       id: `gid://shopify/Order/${o.idNum}`,
@@ -217,57 +245,105 @@ function shopifySim(dataset: SimOrder[], opts?: { rejectCursors?: boolean }) {
   return { impl, count: () => requests };
 }
 
-type LaggyOrder = SimOrder & { visibleAtMs?: number };
+type LaggyOrder = SimOrder & {
+  visibleAtMs?: number;
+  // A later edit the search index has not caught up with: from editedAtMs on
+  // the node carries the new updatedAt, but until reindexedAtMs the order is
+  // still filtered and sorted by its old one.
+  editedAtMs?: number;
+  reindexedAtMs?: number;
+};
 
-// Shopify simulator whose updated_at search index lags: an order is only
-// returned once the injected clock has reached its visibleAtMs. Cursors are
-// keyset positions (updatedAt, id), like Shopify's own, so an order that
-// surfaces behind a cursor is never returned by that cursor's chain.
-function laggyShopifySim(dataset: LaggyOrder[], clock: () => number) {
+// Shopify simulator whose updated_at search index lags behind the primary
+// store. An order is only returned once the injected clock has reached its
+// visibleAtMs, and an edited order keeps its old sort position until the
+// index has caught up while its node is already hydrated fresh. Cursors are
+// keyset positions (indexed updatedAt, id), like Shopify's own, so an order
+// that surfaces behind a cursor is never returned by that cursor's chain.
+// opts.cursorless picks requests (1-based) that are answered with a null
+// endCursor, the upstream anomaly of more pages and no way to reach them.
+function laggyShopifySim(
+  dataset: LaggyOrder[],
+  clock: () => number,
+  opts?: { cursorless?: (request: number) => boolean },
+) {
   let requests = 0;
+  const cursors: Array<string | null> = [];
   const impl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
     requests++;
-    const vars = (JSON.parse(String(init?.body ?? "{}")) as {
-      variables: { cursor: string | null; search: string };
-    }).variables;
+    const request = simRequest(init);
+    const vars = request.variables;
+    cursors.push(vars.cursor);
+    const at = clock();
+    const indexed = (o: LaggyOrder) =>
+      o.editedAtMs !== undefined && at >= (o.reindexedAtMs ?? o.editedAtMs)
+        ? o.editedAtMs
+        : o.updatedAtMs;
+    const hydrated = (o: LaggyOrder) =>
+      o.editedAtMs !== undefined && at >= o.editedAtMs ? o.editedAtMs : o.updatedAtMs;
     const sinceMs = Date.parse(vars.search.match(/'(.*)'/)![1]);
     const after = vars.cursor ? vars.cursor.split(":").slice(1).map(Number) : null;
     const remaining = dataset
-      .filter((o) => o.updatedAtMs >= sinceMs && (o.visibleAtMs ?? 0) <= clock())
+      .filter((o) => indexed(o) >= sinceMs && (o.visibleAtMs ?? 0) <= at)
       .filter(
         (o) =>
           after === null ||
-          o.updatedAtMs > after[0] ||
-          (o.updatedAtMs === after[0] && o.idNum > after[1]),
+          indexed(o) > after[0] ||
+          (indexed(o) === after[0] && o.idNum > after[1]),
       )
-      .sort((a, b) => a.updatedAtMs - b.updatedAtMs || a.idNum - b.idNum);
-    const page = remaining.slice(0, 50);
+      .sort((a, b) => indexed(a) - indexed(b) || a.idNum - b.idNum);
+    const page = remaining.slice(0, requestedPageSize(request));
     const last = page[page.length - 1];
     const nodes = page.map((o) => ({
       id: `gid://shopify/Order/${o.idNum}`,
       legacyResourceId: String(o.idNum),
       name: `#${o.idNum}`,
       createdAt: new Date(o.updatedAtMs - 1000).toISOString(),
-      updatedAt: new Date(o.updatedAtMs).toISOString(),
+      updatedAt: new Date(hydrated(o)).toISOString(),
       tags: [],
       lineItems: { nodes: [] },
     }));
+    const endCursor = opts?.cursorless?.(requests)
+      ? null
+      : last
+        ? `key:${indexed(last)}:${last.idNum}`
+        : vars.cursor;
     return new Response(
       JSON.stringify({
         data: {
           orders: {
             nodes,
-            pageInfo: {
-              hasNextPage: remaining.length > page.length,
-              endCursor: last ? `key:${last.updatedAtMs}:${last.idNum}` : vars.cursor,
-            },
+            pageInfo: { hasNextPage: remaining.length > page.length, endCursor },
           },
         },
       }),
       { status: 200 },
     );
   }) as typeof fetch;
-  return { impl, count: () => requests };
+  return { impl, count: () => requests, cursors: () => cursors };
+}
+
+// Shopify's rate bucket in miniature: after refill() the next `burst`
+// requests are served, every one after that is answered the way Shopify
+// answers an empty bucket (HTTP 200 with a THROTTLED GraphQL error).
+function throttledAfter(inner: typeof fetch, burst: number) {
+  let served = 0;
+  const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (served >= burst) {
+      return new Response(
+        JSON.stringify({ errors: [{ message: "Throttled", extensions: { code: "THROTTLED" } }] }),
+        { status: 200 },
+      );
+    }
+    served++;
+    return inner(input, init);
+  }) as typeof fetch;
+  return {
+    impl,
+    refill: () => {
+      served = 0;
+    },
+  };
 }
 
 // Proxy whose existence query sees nothing, simulating a racing run that
@@ -1128,9 +1204,10 @@ describe("runSync", () => {
     const r1 = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => T + 700 * 60000 });
     expect(r1.added).toBe(500);
     const afterTruncated = await connectionOf(db, WS);
-    expect(afterTruncated.syncCursor).toBe("idx:500");
+    // The cursor is stored together with the run start of the tick that
+    // opened the chain, in one value, so the two cannot come apart.
+    expect(afterTruncated.syncCursor).toBe(chainToken(T + 700 * 60000, "idx:500"));
     expect(afterTruncated.syncCursorSince).toBe(previousSync - OVERLAP_MS);
-    expect(afterTruncated.syncCursorStartedAt).toBe(T + 700 * 60000);
     expect(afterTruncated.lastSyncAt).toBe(previousSync);
     expect(afterTruncated.status).toBe("ok");
 
@@ -1140,7 +1217,6 @@ describe("runSync", () => {
     const afterComplete = await connectionOf(db, WS);
     expect(afterComplete.syncCursor).toBeNull();
     expect(afterComplete.syncCursorSince).toBeNull();
-    expect(afterComplete.syncCursorStartedAt).toBeNull();
     // A completed continuation anchors at the now of the tick that opened the
     // chain, not at the finishing tick's now and not at the chain watermark:
     // the next window (anchor minus overlap) must start before the chain did,
@@ -1195,7 +1271,7 @@ describe("runSync", () => {
     // from it and completes the window.
     const r1 = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => tickAt(1) });
     expect(r1.added).toBe(500);
-    expect((await connectionOf(db, WS)).syncCursor).toBe("idx:500");
+    expect((await connectionOf(db, WS)).syncCursor).toBe(chainToken(tickAt(1), "idx:500"));
     const r2 = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => tickAt(2) });
     expect(r2.added).toBe(50);
     expect(await ordersIn(db, WS)).toHaveLength(550);
@@ -1236,23 +1312,20 @@ describe("runSync", () => {
 
     await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => tickAt(1) });
     const afterOpen = await connectionOf(db, WS);
-    expect(afterOpen.syncCursor).toBe("idx:500");
-    expect(afterOpen.syncCursorStartedAt).toBe(tickAt(1));
+    expect(afterOpen.syncCursor).toBe(chainToken(tickAt(1), "idx:500"));
 
     // Still truncated: the cursor advances, the window and the chain start
     // stay exactly as the opening tick wrote them.
     await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => tickAt(2) });
     const afterMiddle = await connectionOf(db, WS);
-    expect(afterMiddle.syncCursor).toBe("idx:1000");
+    expect(afterMiddle.syncCursor).toBe(chainToken(tickAt(1), "idx:1000"));
     expect(afterMiddle.syncCursorSince).toBe(previousSync - OVERLAP_MS);
-    expect(afterMiddle.syncCursorStartedAt).toBe(tickAt(1));
     expect(afterMiddle.lastSyncAt).toBe(previousSync);
 
     await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => tickAt(3) });
     const afterComplete = await connectionOf(db, WS);
     expect(afterComplete.syncCursor).toBeNull();
     expect(afterComplete.syncCursorSince).toBeNull();
-    expect(afterComplete.syncCursorStartedAt).toBeNull();
     expect(afterComplete.lastSyncAt).toBe(tickAt(1));
     expect(await ordersIn(db, WS)).toHaveLength(1100);
   });
@@ -1298,13 +1371,13 @@ describe("runSync", () => {
     expect((await connectionOf(db, WS)).lastSyncAt).toBe(tickAt(1));
 
     // Ticks 3 and 4 are the one bounded re-scan that picks the straggler up:
-    // ten pages up to the cap, then the two pages holding the last 100.
+    // a full run of pages up to the cap, then the pages holding the last 100.
     const t3 = await tick(tickAt(3));
     expect(t3.result.added).toBe(1);
-    expect(t3.requests).toBe(10);
+    expect(t3.requests).toBe(MAX_PAGES);
     const t4 = await tick(tickAt(4));
     expect(t4.result.added).toBe(0);
-    expect(t4.requests).toBe(2);
+    expect(t4.requests).toBe(100 / ORDERS_PER_PAGE);
     expect((await connectionOf(db, WS)).lastSyncAt).toBe(tickAt(3));
 
     const rows = await ordersIn(db, WS);
@@ -1319,13 +1392,13 @@ describe("runSync", () => {
       expect(idle.result.updated).toBe(0);
       const connection = await connectionOf(db, WS);
       expect(connection.syncCursor).toBeNull();
-      expect(connection.syncCursorStartedAt).toBeNull();
+      expect(connection.syncCursorSince).toBeNull();
       expect(connection.lastSyncAt).toBe(tickAt(n));
     }
     expect(await ordersIn(db, WS)).toHaveLength(600);
   });
 
-  it("never anchors a cursorless truncation past the moment its window was opened", async () => {
+  it("moves nothing when the first page reports more pages without a cursor", async () => {
     const iso = (ms: number) => new Date(ms).toISOString();
     const cursorless = (updatedAtMs: number) =>
       scriptedFetch([
@@ -1335,45 +1408,241 @@ describe("runSync", () => {
           endCursor: null,
         },
       ]);
+    const NO_CURSOR = "Shopify reported more pages but returned no cursor";
 
-    // Fresh window, watermark behind the run's now: the watermark anchors.
-    const behind = await makeDb();
-    await runSync(behind.db, behind.env, WS, {
-      fetchImpl: cursorless(NOW - 120000).impl,
-      now: () => NOW,
-    });
-    expect((await connectionOf(behind.db, WS)).lastSyncAt).toBe(NOW - 120000);
+    // Fresh window. Whether the gathered node's updatedAt lies behind the
+    // run's now or ahead of it (an order edited while the fetch was in
+    // flight) makes no difference: no node-derived watermark anchors
+    // anything, the window is retried as it was.
+    for (const nodeUpdatedAt of [NOW - 120000, NOW + 30000]) {
+      const fresh = await makeDb();
+      const previousSync = NOW - 3600000;
+      await fresh.db
+        .update(schema.storeConnections)
+        .set({ lastSyncAt: previousSync })
+        .where(eq(schema.storeConnections.workspaceId, WS));
+      const result = await runSync(fresh.db, fresh.env, WS, {
+        fetchImpl: cursorless(nodeUpdatedAt).impl,
+        now: () => NOW,
+      });
+      expect(result.error).toBe(NO_CURSOR);
+      const connection = await connectionOf(fresh.db, WS);
+      expect(connection.lastSyncAt).toBe(previousSync);
+      expect(connection.syncCursor).toBeNull();
+      expect(connection.syncCursorSince).toBeNull();
+      expect(connection.lastError).toBe(NO_CURSOR);
+      expect(connection.status).toBe("ok");
+      expect(connection.runningUntil).toBe(0);
+    }
 
-    // Fresh window, watermark ahead of the run's now (an order updated while
-    // the fetch was in flight): the run's own now caps the anchor.
-    const ahead = await makeDb();
-    await runSync(ahead.db, ahead.env, WS, {
-      fetchImpl: cursorless(NOW + 30000).impl,
-      now: () => NOW,
-    });
-    expect((await connectionOf(ahead.db, WS)).lastSyncAt).toBe(NOW);
-
-    // Resumed chain that loses its cursor mid-way: the chain start caps the
-    // anchor, exactly as for a chain that completes.
+    // Resumed chain whose next page comes back cursorless: the chain stays
+    // exactly as the opening tick left it, so the next tick retries from the
+    // same cursor, and the failure is on record instead of passing for
+    // progress.
     const resumed = await makeDb();
     const chainStart = NOW - 600000;
+    const token = chainToken(chainStart, "cursor-from-opening-tick");
     await resumed.db
       .update(schema.storeConnections)
       .set({
         lastSyncAt: chainStart - 600000,
-        syncCursor: "cursor-from-opening-tick",
+        syncCursor: token,
         syncCursorSince: chainStart - 600000 - OVERLAP_MS,
-        syncCursorStartedAt: chainStart,
       })
       .where(eq(schema.storeConnections.workspaceId, WS));
     const page = cursorless(chainStart + 240000);
-    await runSync(resumed.db, resumed.env, WS, { fetchImpl: page.impl, now: () => NOW });
+    const result = await runSync(resumed.db, resumed.env, WS, {
+      fetchImpl: page.impl,
+      now: () => NOW,
+    });
     expect(page.calls[0].body.variables?.cursor).toBe("cursor-from-opening-tick");
+    expect(result.error).toBe(NO_CURSOR);
     const connection = await connectionOf(resumed.db, WS);
-    expect(connection.lastSyncAt).toBe(chainStart);
-    expect(connection.syncCursor).toBeNull();
-    expect(connection.syncCursorSince).toBeNull();
-    expect(connection.syncCursorStartedAt).toBeNull();
+    expect(connection.lastSyncAt).toBe(chainStart - 600000);
+    expect(connection.syncCursor).toBe(token);
+    expect(connection.syncCursorSince).toBe(chainStart - 600000 - OVERLAP_MS);
+    expect(connection.lastError).toBe(NO_CURSOR);
+    expect(connection.runningUntil).toBe(0);
+  });
+
+  it("loses no order when a cursorless first page carries a node edited seconds ago", async () => {
+    const { db, env } = await makeDb();
+    const T0 = Date.parse("2026-09-25T12:00:00.000Z");
+    const previousSync = T0 - 3600000;
+    // 60 orders, 40 to 50 minutes old. Order 1 was edited again ten seconds
+    // before the tick and the search index needs two minutes to catch up, so
+    // it still sorts at its old position while its node already carries the
+    // new updatedAt.
+    const dataset: LaggyOrder[] = Array.from({ length: 60 }, (_, i) => ({
+      idNum: i + 1,
+      updatedAtMs: T0 - 3000000 + (i + 1) * 10000,
+      ...(i === 0 ? { editedAtMs: T0 - 10000, reindexedAtMs: T0 + 110000 } : {}),
+    }));
+    await db
+      .update(schema.storeConnections)
+      .set({ lastSyncAt: previousSync })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    let clock = 0;
+    // The very first request is answered with hasNextPage true, no endCursor.
+    const sim = laggyShopifySim(dataset, () => clock, { cursorless: (request) => request === 1 });
+    const tick = async (at: number) => {
+      clock = at;
+      return runSync(db, env, WS, { fetchImpl: sim.impl, now: () => at });
+    };
+
+    // The freshly edited node says "updated ten seconds ago", but it vouches
+    // for nothing behind the missing cursor: lastSyncAt must stay put.
+    const t1 = await tick(T0);
+    const afterFault = await connectionOf(db, WS);
+    expect.soft(afterFault.lastSyncAt).toBe(previousSync);
+    expect.soft(afterFault.syncCursor).toBeNull();
+    expect.soft(t1.error).toBe("Shopify reported more pages but returned no cursor");
+    expect.soft(afterFault.lastError).toBe("Shopify reported more pages but returned no cursor");
+
+    for (let n = 1; n <= 4; n++) {
+      const result = await tick(T0 + n * 600000);
+      expect.soft(result.error).toBeUndefined();
+    }
+    const rows = await ordersIn(db, WS);
+    expect(rows).toHaveLength(60);
+    // Orders 51 to 60 are the ones a window anchored on the fresh node's
+    // updatedAt never came back for.
+    for (let id = 51; id <= 60; id++) {
+      expect(rows.some((o) => o.shopifyOrderId === String(id))).toBe(true);
+    }
+    expect((await connectionOf(db, WS)).lastSyncAt).toBe(T0 + 4 * 600000);
+  });
+
+  it("resumes from the cursor it last used when a later page comes back cursorless", async () => {
+    const { db, env } = await makeDb();
+    const T0 = Date.parse("2026-09-25T12:00:00.000Z");
+    const previousSync = T0 - 3600000;
+    // 120 orders, 40 to 50 minutes old, order 1 freshly edited with the index
+    // lagging as above. This time the second request is the cursorless one.
+    const dataset: LaggyOrder[] = Array.from({ length: 120 }, (_, i) => ({
+      idNum: i + 1,
+      updatedAtMs: T0 - 3000000 + (i + 1) * 5000,
+      ...(i === 0 ? { editedAtMs: T0 - 10000, reindexedAtMs: T0 + 110000 } : {}),
+    }));
+    await db
+      .update(schema.storeConnections)
+      .set({ lastSyncAt: previousSync })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    let clock = 0;
+    const sim = laggyShopifySim(dataset, () => clock, { cursorless: (request) => request === 2 });
+    const tick = async (at: number) => {
+      clock = at;
+      return runSync(db, env, WS, { fetchImpl: sim.impl, now: () => at });
+    };
+
+    // Tick 1 keeps both pages it read and opens a chain at the cursor the
+    // cursorless request was sent with; lastSyncAt does not move.
+    const t1 = await tick(T0);
+    expect.soft(t1.error).toBeUndefined();
+    const resumeFrom = sim.cursors()[1];
+    expect.soft(typeof resumeFrom).toBe("string");
+    const afterFault = await connectionOf(db, WS);
+    expect.soft(afterFault.lastSyncAt).toBe(previousSync);
+    expect.soft(afterFault.syncCursor).toBe(chainToken(T0, String(resumeFrom)));
+    expect.soft(afterFault.syncCursorSince).toBe(previousSync - OVERLAP_MS);
+    expect.soft(afterFault.lastError).toBeNull();
+
+    // Tick 2 resumes at that keyset position and drains the window.
+    const requestsBefore = sim.count();
+    const t2 = await tick(T0 + 600000);
+    expect.soft(t2.error).toBeUndefined();
+    expect.soft(sim.cursors()[requestsBefore]).toBe(resumeFrom);
+    const rows = await ordersIn(db, WS);
+    expect(rows).toHaveLength(120);
+    const afterChain = await connectionOf(db, WS);
+    expect(afterChain.syncCursor).toBeNull();
+    expect(afterChain.syncCursorSince).toBeNull();
+    expect(afterChain.lastSyncAt).toBe(T0);
+  });
+
+  it("keeps what a throttled run gathered and drains a backlog across ticks", async () => {
+    const { db, env } = await makeDb();
+    const T = Date.parse("2026-09-25T12:00:00.000Z");
+    const previousSync = T - 3600000;
+    const dataset: SimOrder[] = Array.from({ length: 120 }, (_, i) => ({
+      idNum: i + 1,
+      updatedAtMs: T + (i + 1) * 1000,
+    }));
+    await db
+      .update(schema.storeConnections)
+      .set({ lastSyncAt: previousSync })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    // The shop's rate bucket serves two requests per tick, then throttles.
+    const bucket = throttledAfter(shopifySim(dataset).impl, 2);
+    const tickAt = (n: number) => T + n * 600000;
+    const tick = async (n: number) => {
+      bucket.refill();
+      return runSync(db, env, WS, { fetchImpl: bucket.impl, now: () => tickAt(n) });
+    };
+
+    // Tick 1 is throttled on its third request. The two pages it read are
+    // stored and the chain resumes behind them; a throttle after progress is
+    // flow control, not an error.
+    const t1 = await tick(1);
+    expect(t1.error).toBeUndefined();
+    expect(t1.added).toBe(2 * ORDERS_PER_PAGE);
+    const afterFirst = await connectionOf(db, WS);
+    expect(afterFirst.syncCursor).toBe(chainToken(tickAt(1), `idx:${2 * ORDERS_PER_PAGE}`));
+    expect(afterFirst.syncCursorSince).toBe(previousSync - OVERLAP_MS);
+    expect(afterFirst.lastSyncAt).toBe(previousSync);
+    expect(afterFirst.lastError).toBeNull();
+    expect(afterFirst.status).toBe("ok");
+
+    // Every further tick gets the same two requests and moves the chain on
+    // until the window is drained.
+    let ticks = 1;
+    while ((await connectionOf(db, WS)).syncCursor !== null && ticks < 40) {
+      ticks++;
+      const result = await tick(ticks);
+      expect(result.error).toBeUndefined();
+      expect(result.added).toBe(2 * ORDERS_PER_PAGE);
+    }
+    expect(ticks).toBe(120 / (2 * ORDERS_PER_PAGE));
+    expect(await ordersIn(db, WS)).toHaveLength(120);
+    const drained = await connectionOf(db, WS);
+    expect(drained.syncCursorSince).toBeNull();
+    expect(drained.lastSyncAt).toBe(tickAt(1));
+  });
+
+  it("still reports a throttle that hits before a run has read anything", async () => {
+    const { db, env } = await makeDb();
+    const T = Date.parse("2026-09-25T12:00:00.000Z");
+    const dataset: SimOrder[] = Array.from({ length: 20 }, (_, i) => ({
+      idNum: i + 1,
+      updatedAtMs: T + (i + 1) * 1000,
+    }));
+    const chainStart = T + 600000;
+    const token = chainToken(chainStart, `idx:${2 * ORDERS_PER_PAGE}`);
+    await db
+      .update(schema.storeConnections)
+      .set({
+        lastSyncAt: T - 3600000,
+        syncCursor: token,
+        syncCursorSince: T - 3600000 - OVERLAP_MS,
+      })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    // An empty bucket: even the first request of the tick is throttled.
+    const bucket = throttledAfter(shopifySim(dataset).impl, 0);
+    const result = await runSync(db, env, WS, {
+      fetchImpl: bucket.impl,
+      now: () => T + 1200000,
+    });
+    expect(result.error).toBe("Shopify throttled the request");
+    const connection = await connectionOf(db, WS);
+    expect(connection.lastError).toBe("Shopify throttled the request");
+    expect(connection.syncCursor).toBe(token);
+    expect(connection.syncCursorSince).toBe(T - 3600000 - OVERLAP_MS);
+    expect(connection.lastSyncAt).toBe(T - 3600000);
+    expect(connection.runningUntil).toBe(0);
   });
 
   it("re-scans the window when a persisted cursor carries no chain start", async () => {
@@ -1384,14 +1653,14 @@ describe("runSync", () => {
       idNum: i + 1,
       updatedAtMs: T + (i + 1) * 1000,
     }));
-    // A cursor row written before the chain start was recorded.
+    // A bare cursor, the way a row looked before the chain start was stored
+    // alongside it.
     await db
       .update(schema.storeConnections)
       .set({
         lastSyncAt: previousSync,
         syncCursor: "idx:50",
         syncCursorSince: previousSync - OVERLAP_MS,
-        syncCursorStartedAt: null,
       })
       .where(eq(schema.storeConnections.workspaceId, WS));
 
@@ -1410,6 +1679,75 @@ describe("runSync", () => {
     expect((await connectionOf(db, WS)).lastSyncAt).toBe(T + 1200000);
   });
 
+  it("treats a chain start later than the finishing run's own clock as unknown", async () => {
+    const { db, env } = await makeDb();
+    const T = Date.parse("2026-09-25T12:00:00.000Z");
+    const previousSync = T - 3600000;
+    const dataset: SimOrder[] = Array.from({ length: 60 }, (_, i) => ({
+      idNum: i + 1,
+      updatedAtMs: T + (i + 1) * 1000,
+    }));
+    // No tick can have opened a chain a day from now. A stored value like
+    // that must never be allowed to carry lastSyncAt into the future, where
+    // the next window would start after orders nobody has read.
+    await db
+      .update(schema.storeConnections)
+      .set({
+        lastSyncAt: previousSync,
+        syncCursor: chainToken(T + 86400000, "idx:50"),
+        syncCursorSince: previousSync - OVERLAP_MS,
+      })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    const sim = shopifySim(dataset);
+    const r1 = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => T + 600000 });
+    expect(r1.error).toBeUndefined();
+    expect(r1.added).toBe(10);
+    const afterResume = await connectionOf(db, WS);
+    expect(afterResume.lastSyncAt).toBe(previousSync);
+    expect(afterResume.syncCursor).toBeNull();
+
+    const r2 = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => T + 1200000 });
+    expect(r2.added).toBe(50);
+    expect(await ordersIn(db, WS)).toHaveLength(60);
+    expect((await connectionOf(db, WS)).lastSyncAt).toBe(T + 1200000);
+  });
+
+  it("runs a whole cursor chain on the schema as of migration 0003", async () => {
+    // The sync engine reads and writes whole store_connections rows, so a
+    // column it needs from a migration that has not been applied yet fails
+    // every run. Migrations 0000 to 0003 are applied locally and remotely;
+    // this pins that the engine needs nothing newer. Raise the number only
+    // together with a deploy note that the newer migration goes out before
+    // the code does.
+    const { db, env } = openDb({ through: "0003" });
+    await seedWorkspace(db, WS);
+    const T = Date.parse("2026-09-25T12:00:00.000Z");
+    const previousSync = T - 3600000;
+    const dataset: SimOrder[] = Array.from({ length: 620 }, (_, i) => ({
+      idNum: i + 1,
+      updatedAtMs: T + (i + 1) * 60000,
+    }));
+    await db
+      .update(schema.storeConnections)
+      .set({ lastSyncAt: previousSync })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    const sim = shopifySim(dataset);
+    const r1 = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => T + 700 * 60000 });
+    expect(r1.error).toBeUndefined();
+    expect(r1.added).toBe(500);
+    expect((await connectionOf(db, WS)).syncCursor).toBe(chainToken(T + 700 * 60000, "idx:500"));
+
+    const r2 = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => T + 701 * 60000 });
+    expect(r2.error).toBeUndefined();
+    expect(r2.added).toBe(120);
+    const afterComplete = await connectionOf(db, WS);
+    expect(afterComplete.syncCursor).toBeNull();
+    expect(afterComplete.lastSyncAt).toBe(T + 700 * 60000);
+    expect(await ordersIn(db, WS)).toHaveLength(620);
+  });
+
   it("recovers when Shopify rejects a persisted cursor", async () => {
     const { db, env } = await makeDb();
     const T = Date.parse("2026-09-25T12:00:00.000Z");
@@ -1426,16 +1764,18 @@ describe("runSync", () => {
     const honest = shopifySim(dataset);
     const r1 = await runSync(db, env, WS, { fetchImpl: honest.impl, now: () => T + 700 * 60000 });
     expect(r1.added).toBe(500);
-    expect((await connectionOf(db, WS)).syncCursor).toBe("idx:500");
+    expect((await connectionOf(db, WS)).syncCursor).toBe(chainToken(T + 700 * 60000, "idx:500"));
 
     // The persisted cursor has gone stale: Shopify rejects it (fatal).
     const rejecting = shopifySim(dataset, { rejectCursors: true });
     const r2 = await runSync(db, env, WS, { fetchImpl: rejecting.impl, now: () => T + 701 * 60000 });
     expect(r2.error).toContain("cursor");
+    // The rejected cursor is the Shopify cursor alone, without the chain
+    // start it is stored with.
+    expect(r2.error).toBe("cursor idx:500 is invalid");
     const afterReject = await connectionOf(db, WS);
     expect(afterReject.syncCursor).toBeNull();
     expect(afterReject.syncCursorSince).toBeNull();
-    expect(afterReject.syncCursorStartedAt).toBeNull();
     expect(afterReject.lastError).toContain("cursor");
     expect(afterReject.lastSyncAt).toBe(previousSync);
 
@@ -1589,4 +1929,261 @@ describe("runAllSyncs", () => {
     expect(joined).not.toContain("ws_c");
     expect(joined).not.toContain(FAKE_TOKEN);
   });
+});
+
+// Seeded fuzz of the whole engine against a Shopify whose updated_at search
+// index lags behind the primary store. Orders are created and edited over
+// time; each change reaches the index up to MAX_INDEX_LAG_MS later, while
+// nodes are always hydrated fresh, so a node's updatedAt can be ahead of its
+// sort position. Requests take time, and while the shop is active they fail
+// in every way the client distinguishes: more pages without a cursor,
+// throttles, 5xx, timeouts, rejected cursors. Once the shop goes quiet the
+// engine must converge: every order stored, every snapshot at its latest
+// version. The lag bound sits below the 5 minute overlap on purpose; that
+// overlap is the engine's whole allowance for late-surfacing orders.
+type FuzzVersion = { at: number; indexedAt: number };
+type FuzzOrder = { idNum: number; versions: FuzzVersion[] };
+
+const MAX_INDEX_LAG_MS = 240000;
+
+function mulberry32(seed: number) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+type FuzzFaults = { cursorless: number; throttle: number; http503: number; timeout: number; reject: number };
+
+function fuzzShopify(
+  orders: FuzzOrder[],
+  clock: { now: number },
+  rng: () => number,
+  faults: () => FuzzFaults | null,
+) {
+  const graphqlError = (error: Record<string, unknown>) =>
+    new Response(JSON.stringify({ errors: [error] }), { status: 200 });
+  const impl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    // Every request takes between 0.1 and 1 second of shop time.
+    clock.now += 100 + Math.floor(rng() * 900);
+    const at = clock.now;
+    const request = simRequest(init);
+    const vars = request.variables;
+    const active = faults();
+    let cursorless = false;
+    if (active) {
+      const roll = rng();
+      let edge = active.throttle;
+      if (roll < edge) {
+        return graphqlError({ message: "Throttled", extensions: { code: "THROTTLED" } });
+      }
+      edge += active.http503;
+      if (roll < edge) {
+        return new Response("{}", { status: 503 });
+      }
+      edge += active.timeout;
+      if (roll < edge) {
+        throw new DOMException("The operation timed out", "TimeoutError");
+      }
+      edge += active.reject;
+      if (roll < edge && vars.cursor !== null) {
+        return graphqlError({ message: "Invalid cursor for current pagination sort" });
+      }
+      edge += active.cursorless;
+      cursorless = roll < edge;
+    }
+    // What the index knows of an order: its newest change that has been
+    // indexed by now. What the primary store knows: its newest change.
+    const indexedKey = (o: FuzzOrder) => {
+      let key: number | null = null;
+      for (const v of o.versions) {
+        if (v.indexedAt <= at) {
+          key = v.at;
+        }
+      }
+      return key;
+    };
+    const primaryVersion = (o: FuzzOrder) => {
+      let version = -1;
+      o.versions.forEach((v, i) => {
+        if (v.at <= at) {
+          version = i;
+        }
+      });
+      return version;
+    };
+    const sinceMs = Date.parse(vars.search.match(/'(.*)'/)![1]);
+    const after = vars.cursor ? vars.cursor.split(":").slice(1).map(Number) : null;
+    const remaining = orders
+      .map((o) => ({ o, key: indexedKey(o) }))
+      .filter((x): x is { o: FuzzOrder; key: number } => x.key !== null && x.key >= sinceMs)
+      .filter(
+        (x) =>
+          after === null || x.key > after[0] || (x.key === after[0] && x.o.idNum > after[1]),
+      )
+      .sort((a, b) => a.key - b.key || a.o.idNum - b.o.idNum);
+    const page = remaining.slice(0, requestedPageSize(request));
+    const last = page[page.length - 1];
+    const hasNextPage = remaining.length > page.length;
+    const nodes = page.map(({ o }) => {
+      const version = primaryVersion(o);
+      return {
+        id: `gid://shopify/Order/${o.idNum}`,
+        legacyResourceId: String(o.idNum),
+        name: `#${o.idNum}`,
+        createdAt: new Date(o.versions[0].at).toISOString(),
+        updatedAt: new Date(o.versions[version].at).toISOString(),
+        note: `v${version}`,
+        tags: [],
+        lineItems: { nodes: [] },
+      };
+    });
+    const endCursor =
+      cursorless && hasNextPage ? null : last ? `key:${last.key}:${last.o.idNum}` : vars.cursor;
+    return new Response(
+      JSON.stringify({ data: { orders: { nodes, pageInfo: { hasNextPage, endCursor } } } }),
+      { status: 200 },
+    );
+  }) as typeof fetch;
+  return { impl };
+}
+
+describe("runSync against a lagging search index (seeded fuzz)", () => {
+  // The default set is seeds 1 to 24 plus the seeds that lost orders (up to
+  // 455 in one run, silently) while a truncation without a cursor still
+  // anchored lastSyncAt on the newest updatedAt it had gathered; seed 23 is
+  // one of those too. SYNC_FUZZ_SEEDS=n soaks seeds 1 to n instead.
+  const soak = Number(process.env.SYNC_FUZZ_SEEDS ?? 0);
+  const seeds =
+    soak > 0
+      ? Array.from({ length: soak }, (_, i) => i + 1)
+      : [...Array.from({ length: 24 }, (_, i) => i + 1), 66, 90, 111, 158, 165, 226, 230, 258, 282, 287];
+  for (const seed of seeds) {
+    it(`converges on every order and every latest snapshot, seed ${seed}`, async () => {
+      const rng = mulberry32(seed);
+      const int = (lo: number, hi: number) => lo + Math.floor(rng() * (hi - lo + 1));
+      const T0 = Date.parse("2026-09-25T12:00:00.000Z");
+      const TICK_MS = 600000;
+      const ACTIVE_TICKS = 12;
+
+      const orders: FuzzOrder[] = [];
+      const change = (o: FuzzOrder, at: number) => {
+        o.versions.push({ at, indexedAt: at + int(0, MAX_INDEX_LAG_MS) });
+      };
+      // Half the seeds start as a first sync (60 day window), the others
+      // from an earlier sync an hour to a day back.
+      const lastSyncAt = int(0, 1) === 0 ? 0 : T0 - 3600000 - int(0, 86400000);
+      // A backlog the first tick has to pick up, all of it inside the first
+      // window: usually small, sometimes larger than one run can drain.
+      const oldest = lastSyncAt === 0 ? T0 - 40 * 86400000 : lastSyncAt;
+      const backlog = int(0, 3) === 0 ? int(450, 700) : int(0, 80);
+      for (let i = 0; i < backlog; i++) {
+        const o: FuzzOrder = { idNum: orders.length + 1, versions: [] };
+        change(o, int(oldest, T0 - 600000));
+        orders.push(o);
+      }
+      // What happens while the ticks run, in time order: new orders and
+      // edits at random moments, edits that land seconds before a tick (so
+      // the tick sees a fresh node at a stale sort position), and now and
+      // then a bulk edit that touches many orders in the same second.
+      type FuzzEvent = { at: number; kind: "random" | "bulk" };
+      const events: FuzzEvent[] = [];
+      for (let i = int(0, 120); i > 0; i--) {
+        events.push({ at: T0 + int(0, ACTIVE_TICKS * TICK_MS), kind: "random" });
+      }
+      for (let n = 1; n <= ACTIVE_TICKS; n++) {
+        for (let i = int(0, 3); i > 0; i--) {
+          events.push({ at: T0 + n * TICK_MS - int(5000, 200000), kind: "random" });
+        }
+      }
+      if (int(0, 2) === 0) {
+        events.push({ at: T0 + int(0, ACTIVE_TICKS * TICK_MS), kind: "bulk" });
+      }
+      const bulkShare = rng();
+      events.sort((a, b) => a.at - b.at);
+      for (const { at, kind } of events) {
+        if (kind === "bulk") {
+          for (const o of orders) {
+            if (rng() < bulkShare && o.versions[o.versions.length - 1].at < at) {
+              change(o, at);
+            }
+          }
+          continue;
+        }
+        if (orders.length === 0 || rng() < 0.3) {
+          const o: FuzzOrder = { idNum: orders.length + 1, versions: [] };
+          change(o, at);
+          orders.push(o);
+          continue;
+        }
+        const o = orders[int(0, orders.length - 1)];
+        if (o.versions[o.versions.length - 1].at < at) {
+          change(o, at);
+        }
+      }
+
+      const { db, env } = await makeDb();
+      await db
+        .update(schema.storeConnections)
+        .set({ lastSyncAt })
+        .where(eq(schema.storeConnections.workspaceId, WS));
+      // Seeds differ in how hostile the shop is, from flawless to failing
+      // on roughly one request in four.
+      const hostility = [0, 0.3, 1, 3][int(0, 3)];
+      const faults: FuzzFaults = {
+        cursorless: 0.04 * hostility,
+        throttle: 0.02 * hostility,
+        http503: 0.01 * hostility,
+        timeout: 0.005 * hostility,
+        reject: 0.005 * hostility,
+      };
+      const clock = { now: T0 };
+      let faulty = true;
+      const shop = fuzzShopify(orders, clock, rng, () => (faulty ? faults : null));
+      const tick = async (at: number) => {
+        clock.now = Math.max(clock.now, at);
+        const startedAt = clock.now;
+        return runSync(db, env, WS, { fetchImpl: shop.impl, now: () => startedAt });
+      };
+
+      for (let n = 1; n <= ACTIVE_TICKS + 1; n++) {
+        await tick(T0 + n * TICK_MS);
+        // Sometimes somebody presses the sync button shortly after.
+        if (int(0, 3) === 0) {
+          await tick(clock.now + int(30000, 120000));
+        }
+      }
+
+      // The shop goes quiet and stops failing. The engine has to finish any
+      // chain and settle; the two idle ticks at the end prove it has.
+      faulty = false;
+      let idle = 0;
+      let quietTicks = 0;
+      while (idle < 2 && quietTicks < 80) {
+        quietTicks++;
+        const result = await tick(clock.now + TICK_MS);
+        expect(result.error).toBeUndefined();
+        const chain = (await connectionOf(db, WS)).syncCursor;
+        idle = chain === null && result.added === 0 && result.updated === 0 ? idle + 1 : 0;
+      }
+      expect(idle).toBe(2);
+
+      const rows = await ordersIn(db, WS);
+      const stored = new Map(rows.map((row) => [row.shopifyOrderId, row]));
+      const missing = orders.filter((o) => !stored.has(String(o.idNum))).map((o) => o.idNum);
+      expect(missing).toEqual([]);
+      const stale = orders
+        .filter((o) => {
+          const row = stored.get(String(o.idNum));
+          return (row?.shopify as { note: string }).note !== `v${o.versions.length - 1}`;
+        })
+        .map((o) => o.idNum);
+      expect(stale).toEqual([]);
+      expect(rows).toHaveLength(orders.length);
+    });
+  }
 });

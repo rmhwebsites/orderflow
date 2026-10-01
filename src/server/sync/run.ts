@@ -138,6 +138,30 @@ async function fencedConnectionWrite(
   return changesOf(result) > 0;
 }
 
+// What a truncated run leaves in store_connections.sync_cursor: the Shopify
+// cursor to resume from, prefixed with the run start (now) of the tick that
+// opened the cursor chain, as "<ms>|<cursor>". The chain start is the anchor
+// a finished chain needs (see the terminal write in runSync), and it rides in
+// the same value as the cursor so the two are written, carried forward and
+// cleared together, and so the engine needs no column beyond the two that
+// migration 0003 added. A bare cursor with no prefix (a row written before
+// the chain start was recorded) reads as a chain whose start is unknown.
+const RESUME_TOKEN = /^(\d{1,15})\|([\s\S]+)$/;
+
+function resumeToken(openedAt: number, cursor: string): string {
+  return `${Math.max(0, Math.trunc(openedAt))}|${cursor}`;
+}
+
+function parseResumeToken(stored: unknown): { cursor: string; openedAt: number | null } | null {
+  if (typeof stored !== "string" || stored.length === 0) {
+    return null;
+  }
+  const parts = stored.match(RESUME_TOKEN);
+  return parts
+    ? { cursor: parts[2], openedAt: Number(parts[1]) }
+    : { cursor: stored, openedAt: null };
+}
+
 type KnownOrder = { id: string; shopify: unknown };
 
 // Claim, then read. orders.synced_at is the start time (now) of the latest
@@ -248,15 +272,14 @@ export async function runSync(
       return { ...empty(), error: TOKEN_UNREADABLE, ...(held ? {} : { superseded: true }) };
     }
 
-    // A persisted cursor means an earlier run stopped at the page cap: resume
-    // that exact window from the cursor instead of opening a new one.
-    const resumeCursor =
-      typeof connection.syncCursor === "string" && connection.syncCursor.length > 0
-        ? connection.syncCursor
-        : null;
-    const resuming = resumeCursor !== null && typeof connection.syncCursorSince === "number";
+    // A persisted cursor means an earlier run stopped before the end of its
+    // window: resume that exact window from the cursor instead of opening a
+    // new one.
+    const resume = parseResumeToken(connection.syncCursor);
+    const resumeSince = connection.syncCursorSince;
+    const resuming = resume !== null && typeof resumeSince === "number";
     const sinceMs = resuming
-      ? (connection.syncCursorSince as number)
+      ? resumeSince
       : connection.lastSyncAt === 0
         ? now - FIRST_SYNC_WINDOW_MS
         : Math.max(connection.lastSyncAt - OVERLAP_MS, 0);
@@ -267,7 +290,7 @@ export async function runSync(
       token,
       sinceIso,
       opts?.fetchImpl ?? fetch,
-      resuming ? { startCursor: resumeCursor } : undefined,
+      resuming ? { startCursor: resume.cursor } : undefined,
     );
 
     if (fetched.kind === "auth") {
@@ -280,16 +303,17 @@ export async function runSync(
     }
 
     if (fetched.kind === "transient" || fetched.kind === "fatal") {
-      // Status and lastSyncAt stay untouched so the next cron tick retries;
-      // record what happened and release the lease. A fatal while resuming
-      // also drops the cursor (Shopify cursors go stale), falling back to the
-      // plain window path next tick.
+      // Status, lastSyncAt and any cursor chain stay untouched so the next
+      // cron tick retries from the same place; record what happened and
+      // release the lease. A fatal while resuming also drops the chain
+      // (Shopify cursors go stale), falling back to the plain window path
+      // next tick.
       const detail = clip(fetched.detail);
       const held = await fencedConnectionWrite(db, workspaceId, myLease, {
         lastError: detail,
         runningUntil: 0,
         ...(fetched.kind === "fatal" && resuming
-          ? { syncCursor: null, syncCursorSince: null, syncCursorStartedAt: null }
+          ? { syncCursor: null, syncCursorSince: null }
           : {}),
       });
       if (!held) {
@@ -430,57 +454,53 @@ export async function runSync(
 
     // When the window this run worked on was opened: this run's own now for
     // a fresh window, the now of the opening tick for a resumed cursor chain.
-    // A persisted cursor without a recorded start degrades to the untouched
-    // lastSyncAt, which is never later than the true start.
-    const windowOpenedAt = resuming
-      ? (connection.syncCursorStartedAt ?? connection.lastSyncAt)
-      : now;
+    // A chain whose start is unknown (a bare cursor) or impossible (later
+    // than this run's own now, which no opening tick can have been) degrades
+    // to the untouched lastSyncAt, which is never later than the true start.
+    const chainOpenedAt =
+      resuming && resume.openedAt !== null && resume.openedAt <= now ? resume.openedAt : null;
+    const windowOpenedAt = resuming ? (chainOpenedAt ?? connection.lastSyncAt) : now;
 
     let terminal: ConnectionWrite;
-    if (fetched.truncated && fetched.endCursor) {
-      // Stopped at the page cap: persist the cursor, its window and when the
-      // chain was opened; progress is carried by the cursor, so lastSyncAt
-      // stays untouched until the window is fully drained.
+    if (fetched.truncated) {
+      // The run stopped before the end of its window (page cap, a page
+      // without a cursor, a throttle or blip part-way). The client always
+      // names the cursor to resume from, so progress is carried by the
+      // cursor alone: persist it with the chain start and the window it
+      // belongs to, and leave lastSyncAt untouched until the window is fully
+      // drained. Nothing here is derived from the fetched nodes. In
+      // particular the newest updatedAt among them is not an anchor: Shopify
+      // hydrates a node fresh while still sorting it by a lagging index, so
+      // that value can sit far ahead of orders the run never reached.
       terminal = {
-        syncCursor: fetched.endCursor,
+        syncCursor: resumeToken(windowOpenedAt, fetched.endCursor),
         syncCursorSince: sinceMs,
-        syncCursorStartedAt: windowOpenedAt,
         runningUntil: 0,
         status: "ok",
         lastError: null,
       };
     } else {
-      // Window complete (or truncated with no cursor to resume from, where
-      // the watermark is the only anchor). One rule holds for every case:
-      // lastSyncAt never moves past the moment the window was opened.
-      // Shopify's updated_at search can surface an order late, so a fetch
-      // only vouches for orders that were searchable when it passed their
-      // sort position, and no fetch of this window ran before it was opened.
-      // The next window starts at the anchor minus the overlap, so an order
-      // is re-read unless it surfaced more than the overlap after its update.
+      // Window complete. One rule holds for both cases: lastSyncAt never
+      // moves past the moment the window was opened. Shopify's updated_at
+      // search can surface an order late, so a fetch only vouches for orders
+      // that were searchable when it passed their sort position, and no
+      // fetch of this window ran before it was opened. The next window
+      // starts at the anchor minus the overlap, so an order is re-read
+      // unless it surfaced more than the overlap after its update.
       // - completed plain window: this run's now, captured before the fetch;
       // - completed cursor chain: the opening tick's now, not the finishing
       //   tick's. The cursor never returns to an order that surfaced behind
       //   it, so anchoring at the finishing tick would skip such an order for
-      //   good. Not the chain watermark either: that re-fetches a dense burst
-      //   inside the overlap on every other tick forever, whereas the chain
-      //   start costs at most a bounded re-scan, because each new chain opens
-      //   strictly later than the one before;
-      // - truncated without cursor: the max updatedAt seen (the client
-      //   guarantees one; the previous lastSyncAt stands in should it ever be
-      //   missing or unparseable), capped at the window opening.
-      const watermarkMs = fetched.maxUpdatedAt ? Date.parse(fetched.maxUpdatedAt) : NaN;
-      const watermarkAnchor = Number.isNaN(watermarkMs) ? connection.lastSyncAt : watermarkMs;
-      const anchor = fetched.truncated
-        ? Math.min(watermarkAnchor, windowOpenedAt)
-        : resuming
-          ? Math.max(connection.lastSyncAt, windowOpenedAt)
-          : now;
+      //   good. Not a watermark of the fetched nodes either: besides not
+      //   being a sort position, it re-fetches a dense burst inside the
+      //   overlap on every other tick forever, whereas the chain start costs
+      //   at most a bounded re-scan, because each new chain opens strictly
+      //   later than the one before.
+      const anchor = resuming ? Math.max(connection.lastSyncAt, windowOpenedAt) : now;
       terminal = {
         lastSyncAt: anchor,
         syncCursor: null,
         syncCursorSince: null,
-        syncCursorStartedAt: null,
         runningUntil: 0,
         status: "ok",
         lastError: null,

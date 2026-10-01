@@ -17,17 +17,18 @@ PO flow with mandatory human review before send (Phase 7).
 
 Repo: github.com/rmhwebsites/orderflow (PUBLIC - never commit secrets).
 Branch: build/m1-core. All work is committed and pushed through 116a744
-(plus this handoff commit).
+(plus this handoff commit). The sync repair commits after that (84b3266,
+7dade33 and the round 2 repair) are committed locally and not pushed yet.
 
 ## Build state (what is DONE and verified)
 
 - Phase 0 scaffold, Phase 1 data layer, Phase 2 auth/workspaces/invites,
   Phase 3 sync engine: implemented, each through a two-gate review
   (spec compliance, then code quality), all requested fixes applied.
-- 117 tests green (`npm run test` = drizzle-kit check + vitest), tsc clean.
-- Migrations 0000-0003 applied BOTH locally and to remote D1. Migration 0004
-  (store_connections.sync_cursor_started_at) is committed but NOT applied
-  anywhere yet: see "Sync review repairs, round 1" below.
+- 173 tests green (`npm run test` = drizzle-kit check + vitest), tsc clean.
+- Migrations 0000-0003 applied BOTH locally and to remote D1, and they are
+  the whole schema: migration 0004 was withdrawn before it was applied
+  anywhere (see "Sync review repairs, round 2" below).
 - Local end-to-end evidence exists for: magic-link sign-in, workspace create
   with 7 default statuses, invite claim (both paths), revocation, sync engine
   (idempotent, cursor-resumed pagination, fenced lease) via simulator tests.
@@ -103,21 +104,95 @@ that commit found two real defects, both repaired test-first:
    never returns to an order that appears behind it, and the finishing tick's
    now put the next window after it, losing the order for good. Rule now:
    lastSyncAt never moves past the moment the window was opened. A completed
-   cursor chain anchors at the now of the tick that OPENED the chain
-   (store_connections.sync_cursor_started_at, migration 0004); a cursorless
-   truncation anchors at min(watermark, window opening). Cost: at most one
-   bounded re-scan after a dense burst, then one request per tick. Do not
-   "simplify" this back to the finishing tick's now or to the chain watermark.
+   cursor chain anchors at the now of the tick that OPENED the chain. Cost:
+   at most one bounded re-scan after a dense burst, then one request per
+   tick. Do not "simplify" this back to the finishing tick's now or to the
+   chain watermark. (Round 1 stored the chain start in a new column and let
+   a truncation without a cursor anchor on a watermark; round 2 below
+   replaced both.)
 
-DEPLOY BLOCKER: migration 0004 must be applied before the new code runs, or
-every runSync fails on the whole-row store_connections read (no such column).
-Run `npm run db:migrate:local` for local dev and `npm run db:migrate:remote`
-before the smoke deploy. Neither has been run yet.
+## Sync review repairs, round 2 (supersedes parts of round 1)
+
+A third adversarial review found three issues. All three are repaired
+test-first.
+
+1. No anchor is derived from fetched nodes any more. Shopify sorts by a
+   lagging search index but hydrates nodes fresh, so an order edited seconds
+   ago can still sort at its old position while its node says "updated just
+   now". The old rule for a truncation without a cursor (anchor at the newest
+   updatedAt gathered) then jumped lastSyncAt to about now and silently
+   skipped every older order the run had not reached. Now every truncation
+   is resumable: the client (src/server/shopify/client.ts) always returns
+   the cursor to resume from. "More pages but no cursor" on the first request
+   of a run is a transient error (nothing moves, lastError says so); on a
+   later request the run keeps what it read and resumes from the cursor that
+   request was sent with. run.ts has two anchors left, both clock values:
+   this run's now (plain window) and the chain start (cursor chain).
+2. The orders query asked for 50 orders x 50 line items, about 7,953 cost
+   points. Shopify refuses any query above 1,000 requested points before
+   running it, on every plan, so by the documented rules no order would ever
+   have synced. The page is now 5 orders x 50 line items (about 798 points;
+   the line item cap is unchanged so no order loses items) and a run reads
+   up to 100 pages, which keeps the 500 orders per run ceiling. Because a
+   run is now many small requests, a retryable failure part-way (throttle,
+   5xx, timeout, garbled body) no longer throws away the pages already
+   read: the run ends as a truncation and the next tick resumes from the
+   last cursor. A failure on the first request is still reported as before.
+   client.test.ts prices the query that is actually sent and fails above
+   800 points.
+   NOT VERIFIED LIVE: the 798 is computed from Shopify's documented rules
+   (object 1, connection 2 + page size x node cost, limit 1,000), not read
+   from a shop. On the first real sync, check it: either the sync works, or
+   lastError / the sync_error event shows Shopify's "Query cost is N, which
+   exceeds the single query max cost limit (1000)", in which case lower
+   ORDERS_PER_PAGE in client.ts (and raise MAX_PAGES to match). To read the
+   exact number, POST the query with the shop token and look at
+   extensions.cost.requestedQueryCost in the response (the request header
+   Shopify-GraphQL-Cost-Debug: 1 adds a per-field breakdown).
+3. Migration 0004 is gone. The chain start now rides inside sync_cursor as
+   "<chain start ms>|<Shopify cursor>" (resumeToken / parseResumeToken in
+   run.ts), so the engine needs nothing beyond migration 0003, the round 1
+   deploy blocker no longer exists, and cursor and chain start can never be
+   written or cleared apart. A bare cursor (no prefix) or a chain start
+   later than the run's own clock reads as "start unknown" and degrades to
+   one re-scan from the untouched lastSyncAt. run.test.ts pins this with a
+   test that runs a whole chain on a database migrated only through 0003:
+   if a later phase adds a column to a table the engine reads or writes,
+   that test fails until the number is raised, which is the reminder that
+   the migration has to be applied before that code is deployed.
+
+Also new in run.test.ts: the simulators serve the page size the query asks
+for, and a seeded fuzz drives the whole engine against a shop whose index
+lags (fresh nodes at stale sort positions, cursorless pages, throttles,
+5xx, timeouts, rejected cursors) and checks that every order and every
+latest snapshot arrives. `SYNC_FUZZ_SEEDS=3000 npx vitest run
+src/server/sync/run.test.ts -t "seeded fuzz"` soaks it (about 90 seconds).
+The fuzz keeps index lag under the 5 minute overlap on purpose: an order
+that takes longer than the overlap to become searchable is outside what
+this design promises.
+
+Known limits, not fixed here (decide before relying on them):
+- Line items beyond 50 per order are still cut off silently, as before.
+- On plans with a small rate bucket, Shopify's throttle (not MAX_PAGES) is
+  expected to end a backlog run early, by a rough estimate after a hundred
+  orders or so; a 60 day first sync of a busy shop then drains over several
+  ticks through the cursor chain. That is by design, and untested live. If
+  it proves too slow, pace the page loop against
+  extensions.cost.throttleStatus instead of raising the page size.
+- While a cursor chain is draining, lastSyncAt stays at its old value on
+  purpose (0 during a first sync). The Phase 5 connection card should show
+  a "catching up" state whenever sync_cursor is set, not a stale "last
+  synced" time.
+- A slow shop can keep a full 100 request run going past the 120 second
+  lease. That is safe (fenced writes, claim-then-read) but wasteful; a wall
+  clock budget in the page loop would be a one-line stop now that every
+  truncation is resumable.
 
 ## Immediate next steps, in order
 
-1. Apply migration 0004 locally and to remote D1 (see the deploy blocker
-   above), re-run npm run test + tsc.
+1. Nothing to migrate: 0000-0003 are applied locally and remotely and
+   `npx drizzle-kit generate` reports no schema changes. Re-run npm run
+   test + tsc.
 2. SMOKE DEPLOY (early, agreed with Ryan) - exact sequence:
    a. `openssl rand -base64 32 | npx wrangler secret put BETTER_AUTH_SECRET`
       (same for ENCRYPTION_KEY; `openssl rand -hex 16` for CRON_SECRET).
@@ -130,6 +205,12 @@ before the smoke deploy. Neither has been run yet.
       arrive from orders@impactrentals.store. Then sign in, create the
       "IMPACT Rentals" workspace. Check `npx wrangler tail` for cron runs
       (every 10 min; they no-op without a store connection).
+   e. Once the store connection exists, watch the first real sync for the
+      query cost check described under round 2, item 2. The query also
+      selects customer fields; if Shopify answers "Access denied for
+      customer field", the token needs read_customers next to read_orders
+      (not verified live either). Both failures are loud: lastError on the
+      connection card and a sync_error event.
 3. Phase 4 per the implementation plan (desk read/write APIs), then 5 (UI +
    realtime), 6 (PWA/push/notifications), 7 (PO flow), 8 (polish/docs).
    Ryan must supply a Shopify custom-app Admin API token (read_orders) for

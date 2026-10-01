@@ -38,11 +38,6 @@ export const storeConnections = sqliteTable("store_connections", {
   // (which livelocks when 500+ orders share one updatedAt second).
   syncCursor: text("sync_cursor"),
   syncCursorSince: integer("sync_cursor_since"),
-  // The run-start time of the tick that opened the cursor chain. A finished
-  // chain anchors last_sync_at here, never later: rows the search index
-  // surfaced behind the cursor are only re-covered by a window that starts
-  // before the chain began.
-  syncCursorStartedAt: integer("sync_cursor_started_at"),
 });
 
 export const statuses = sqliteTable("statuses", {

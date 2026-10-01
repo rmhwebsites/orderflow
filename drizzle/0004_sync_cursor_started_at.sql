@@ -1,1 +1,0 @@
-ALTER TABLE `store_connections` ADD `sync_cursor_started_at` integer;
