@@ -258,3 +258,31 @@ Known limits, not fixed here (decide before relying on them):
 - All-Cloudflare architecture was researched and chosen over Supabase and
   Firebase for cost ($0-5/mo) at Ryan's explicit direction; email moved from
   Resend to Cloudflare Email Service at his direction.
+
+## STATE UPDATE, 2026-10-01 evening (supersedes anything above that conflicts)
+
+- HEAD is 658c193 plus this handoff commit, all pushed. Commits 84b3266,
+  7dade33 and 658c193 are the pre-deploy sync fixes plus two repair rounds.
+  Gates at HEAD: 173 tests green, tsc clean, working tree clean.
+- The round 2 repair (658c193) has NOT been independently reviewed. The
+  verification workflow was stopped on purpose to save usage. Ultracode is OFF
+  and Ryan questioned the value of repeated repair loops: from here on do ONE
+  review pass per phase, and reserve heavy review for sign-in, store tokens and
+  PO sending. Do NOT restart sync hardening loops.
+- First thing next session: read `git diff f4ffaf8 HEAD -- src/` once yourself.
+  Check two things in particular: (1) the Shopify orders query page sizes. A
+  reviewer found orders(first 50) with lineItems(first 50) exceeds Shopify's
+  1,000 point single-query cost limit, which would make every real sync fail
+  loudly; confirm round 2 shrank the page sizes, and when the real store token
+  exists read extensions.cost.requestedQueryCost from one live request.
+  (2) the truncation and lastSyncAt anchoring rules still read coherently.
+- Migrations: drizzle/ holds 0000-0003 only at HEAD (a 0004 added in round 1
+  appears to have been removed again in round 2). drizzle-kit check and the
+  drift test are green, and local plus remote D1 are both at 0003. Run
+  `npm run db:generate` to confirm it reports no changes before deploying.
+- Commit trailer is now: Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+- Next steps are otherwise unchanged: the smoke deploy sequence above, then
+  Phase 4 (desk APIs), Phase 5 (screens), 6, 7, 8.
+- Ryan is creating a Shopify custom app token (read orders) for the IMPACT
+  store. He enters it himself in workspace settings once that screen exists;
+  it must never be pasted into chat or committed.
