@@ -8,7 +8,7 @@
     "build": "next build",
     "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
     "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
-    "test": "vitest run",
+    "test": "drizzle-kit check && vitest run",
     "db:generate": "drizzle-kit generate",
     "db:migrate:local": "wrangler d1 migrations apply order_desk --local",
     "db:migrate:remote": "wrangler d1 migrations apply order_desk --remote",

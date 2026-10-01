@@ -1,5 +1,11 @@
 // AES-GCM encryption for store tokens. WebCrypto only (crypto.subtle), so it
-// runs on workerd. Payload format: base64(iv) + "." + base64(ciphertext).
+// runs on workerd. Payload format: "v1." + base64(iv) + "." + base64(ciphertext).
+// A single ENCRYPTION_KEY secret is in use; the v1 prefix reserves room for key
+// rotation (a future version can change the key or layout without ambiguity).
+// Callers bind a ciphertext to its row by passing the workspaceId as aad
+// (AES-GCM additionalData), so a payload copied onto another row fails to decrypt.
+
+const VERSION = "v1";
 
 function toBase64(bytes: Uint8Array): string {
   let binary = "";
@@ -29,27 +35,35 @@ async function importKey(base64Key: string): Promise<CryptoKey> {
   ]);
 }
 
-export async function encryptSecret(plaintext: string, base64Key: string): Promise<string> {
+function gcmParams(iv: Uint8Array<ArrayBuffer>, aad?: string): AesGcmParams {
+  const params: AesGcmParams = { name: "AES-GCM", iv };
+  if (aad) {
+    params.additionalData = new TextEncoder().encode(aad);
+  }
+  return params;
+}
+
+export async function encryptSecret(plaintext: string, base64Key: string, aad?: string): Promise<string> {
   const key = await importKey(base64Key);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ciphertext = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
+    gcmParams(iv, aad),
     key,
     new TextEncoder().encode(plaintext),
   );
-  return toBase64(iv) + "." + toBase64(new Uint8Array(ciphertext));
+  return VERSION + "." + toBase64(iv) + "." + toBase64(new Uint8Array(ciphertext));
 }
 
-export async function decryptSecret(payload: string, base64Key: string): Promise<string> {
+export async function decryptSecret(payload: string, base64Key: string, aad?: string): Promise<string> {
   const parts = payload.split(".");
-  if (parts.length !== 2 || parts[0].length === 0 || parts[1].length === 0) {
+  if (parts.length !== 3 || parts[0] !== VERSION || parts[1].length === 0 || parts[2].length === 0) {
     throw new Error("Invalid encrypted payload format");
   }
   let iv: Uint8Array<ArrayBuffer>;
   let ciphertext: Uint8Array<ArrayBuffer>;
   try {
-    iv = fromBase64(parts[0]);
-    ciphertext = fromBase64(parts[1]);
+    iv = fromBase64(parts[1]);
+    ciphertext = fromBase64(parts[2]);
   } catch {
     throw new Error("Invalid encrypted payload format");
   }
@@ -59,9 +73,9 @@ export async function decryptSecret(payload: string, base64Key: string): Promise
   const key = await importKey(base64Key);
   let plaintext: ArrayBuffer;
   try {
-    plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
+    plaintext = await crypto.subtle.decrypt(gcmParams(iv, aad), key, ciphertext);
   } catch {
-    throw new Error("Decryption failed: payload is corrupt or key is wrong");
+    throw new Error("Decryption failed: payload is corrupt, bound to a different row, or the key is wrong");
   }
   return new TextDecoder().decode(plaintext);
 }
