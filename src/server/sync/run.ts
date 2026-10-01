@@ -2,7 +2,7 @@
 // Relative imports on purpose: this module is bundled into the custom worker
 // entrypoint (cron), not only the Next.js build.
 
-import { and, asc, eq, inArray, lte } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, lte } from "drizzle-orm";
 import type { Db } from "../../db";
 import { events, orders, statuses, storeConnections } from "../../db/schema";
 import { decryptSecret } from "../crypto";
@@ -18,6 +18,9 @@ export type SyncResult = {
   updatedOrderIds: string[];
   skipped?: "running" | "no-connection" | "disabled";
   error?: string;
+  // True when another run took over the lease mid-flight; this run wrote no
+  // terminal connection state and its lastError/status must not be trusted.
+  superseded?: boolean;
 };
 
 export type SyncOptions = {
@@ -31,7 +34,11 @@ const LEASE_MS = 120000;
 const OVERLAP_MS = 300000;
 const FIRST_SYNC_WINDOW_MS = 60 * 24 * 60 * 60 * 1000;
 const LAST_ERROR_MAX = 300;
-const EXISTENCE_CHUNK = 100;
+const SYNC_ERROR_EVENT_WINDOW_MS = 3600000;
+// D1 allows at most 100 bound parameters per statement; each chunk binds its
+// ids plus the workspaceId, so 50 leaves comfortable headroom.
+// Exported for the regression test that pins the parameter math.
+export const EXISTENCE_CHUNK = 50;
 
 const TOKEN_UNREADABLE = "Token unreadable, re-enter it in Settings";
 const TOKEN_REJECTED = "Shopify rejected the token. Update the connection in Settings.";
@@ -42,7 +49,8 @@ function clip(text: string): string {
 
 // Rows affected by a write, across drivers: D1 reports meta.changes, the
 // better-sqlite3 test driver reports changes at the top level. An unknown
-// shape counts as 1: a double-run is idempotent, a never-run is an outage.
+// shape counts as 1 (and is logged): a double-run is idempotent, a never-run
+// is an outage.
 function changesOf(result: unknown): number {
   if (typeof result === "object" && result !== null) {
     const direct = (result as { changes?: unknown }).changes;
@@ -54,27 +62,56 @@ function changesOf(result: unknown): number {
       return meta.changes;
     }
   }
+  let shape = "unserializable";
+  try {
+    shape = JSON.stringify(result) ?? String(result);
+  } catch {
+    // keep the fallback label
+  }
+  console.warn("[sync] unknown write result shape, assuming one row affected: " + shape);
   return 1;
 }
 
 // Two statements that must land together. db.batch is the atomic path on D1;
 // the better-sqlite3-backed Db injected by tests has no batch method, so fall
 // back to sequential awaits (drizzle builders are thenables that run on await).
+// Returns the per-statement results so callers can read rows-affected.
 // Exported for its own unit tests.
 export async function applyPair(
   db: Db,
   a: PromiseLike<unknown>,
   b: PromiseLike<unknown>,
-): Promise<void> {
+): Promise<unknown[]> {
   const batchable = db as unknown as {
-    batch?: (statements: [PromiseLike<unknown>, PromiseLike<unknown>]) => Promise<unknown>;
+    batch?: (statements: [PromiseLike<unknown>, PromiseLike<unknown>]) => Promise<unknown[]>;
   };
   if (typeof batchable.batch === "function") {
-    await batchable.batch([a, b]);
-  } else {
-    await a;
-    await b;
+    return await batchable.batch([a, b]);
   }
+  return [await a, await b];
+}
+
+type ConnectionWrite = Partial<typeof storeConnections.$inferInsert>;
+
+// Terminal connection writes are fenced on the exact lease value this run
+// set: if another run has re-leased the row since, zero rows match and this
+// stale run must not touch anything else either.
+async function fencedConnectionWrite(
+  db: Db,
+  workspaceId: string,
+  myLease: number,
+  set: ConnectionWrite,
+): Promise<boolean> {
+  const result = await db
+    .update(storeConnections)
+    .set(set)
+    .where(
+      and(
+        eq(storeConnections.workspaceId, workspaceId),
+        eq(storeConnections.runningUntil, myLease),
+      ),
+    );
+  return changesOf(result) > 0;
 }
 
 export async function runSync(
@@ -84,18 +121,23 @@ export async function runSync(
   opts?: SyncOptions,
 ): Promise<SyncResult> {
   const now = opts?.now?.() ?? Date.now();
-  const empty = (): SyncResult => ({ added: 0, updated: 0, addedOrderIds: [], updatedOrderIds: [] });
+  const empty = (): SyncResult => ({
+    added: 0,
+    updated: 0,
+    addedOrderIds: [],
+    updatedOrderIds: [],
+  });
 
-  const connectionRows = await db
+  const preLeaseRows = await db
     .select()
     .from(storeConnections)
     .where(eq(storeConnections.workspaceId, workspaceId))
     .limit(1);
-  const connection = connectionRows[0];
-  if (!connection) {
+  const preLease = preLeaseRows[0];
+  if (!preLease) {
     return { ...empty(), skipped: "no-connection" };
   }
-  if (connection.status === "disabled") {
+  if (preLease.status === "disabled") {
     return { ...empty(), skipped: "disabled" };
   }
 
@@ -103,15 +145,25 @@ export async function runSync(
   // running_until forward; a concurrent run matches zero rows and skips.
   // Should a run die mid-way, the lease expires after LEASE_MS and the
   // conflict-safe insert pairs below make the replay a no-op.
+  const myLease = now + LEASE_MS;
   const leaseResult = await db
     .update(storeConnections)
-    .set({ runningUntil: now + LEASE_MS })
+    .set({ runningUntil: myLease })
     .where(
       and(eq(storeConnections.workspaceId, workspaceId), lte(storeConnections.runningUntil, now)),
     );
   if (changesOf(leaseResult) === 0) {
     return { ...empty(), skipped: "running" };
   }
+
+  // The pre-lease row may be stale by the time the lease is ours (another run
+  // may have finished in between); work from a fresh read.
+  const connRows = await db
+    .select()
+    .from(storeConnections)
+    .where(eq(storeConnections.workspaceId, workspaceId))
+    .limit(1);
+  const connection = connRows[0] ?? preLease;
 
   let added = 0;
   let updated = 0;
@@ -123,15 +175,24 @@ export async function runSync(
     try {
       token = await decryptSecret(connection.encryptedToken, env.ENCRYPTION_KEY, workspaceId);
     } catch {
-      await db
-        .update(storeConnections)
-        .set({ status: "error", lastError: TOKEN_UNREADABLE, runningUntil: 0 })
-        .where(eq(storeConnections.workspaceId, workspaceId));
-      return { ...empty(), error: TOKEN_UNREADABLE };
+      const held = await fencedConnectionWrite(db, workspaceId, myLease, {
+        status: "error",
+        lastError: TOKEN_UNREADABLE,
+        runningUntil: 0,
+      });
+      return { ...empty(), error: TOKEN_UNREADABLE, ...(held ? {} : { superseded: true }) };
     }
 
-    const sinceMs =
-      connection.lastSyncAt === 0
+    // A persisted cursor means an earlier run stopped at the page cap: resume
+    // that exact window from the cursor instead of opening a new one.
+    const resumeCursor =
+      typeof connection.syncCursor === "string" && connection.syncCursor.length > 0
+        ? connection.syncCursor
+        : null;
+    const resuming = resumeCursor !== null && typeof connection.syncCursorSince === "number";
+    const sinceMs = resuming
+      ? (connection.syncCursorSince as number)
+      : connection.lastSyncAt === 0
         ? now - FIRST_SYNC_WINDOW_MS
         : Math.max(connection.lastSyncAt - OVERLAP_MS, 0);
     const sinceIso = new Date(sinceMs).toISOString();
@@ -141,36 +202,61 @@ export async function runSync(
       token,
       sinceIso,
       opts?.fetchImpl ?? fetch,
+      resuming ? { startCursor: resumeCursor } : undefined,
     );
 
     if (fetched.kind === "auth") {
-      await db
-        .update(storeConnections)
-        .set({ status: "error", lastError: TOKEN_REJECTED, runningUntil: 0 })
-        .where(eq(storeConnections.workspaceId, workspaceId));
-      return { ...empty(), error: TOKEN_REJECTED };
+      const held = await fencedConnectionWrite(db, workspaceId, myLease, {
+        status: "error",
+        lastError: TOKEN_REJECTED,
+        runningUntil: 0,
+      });
+      return { ...empty(), error: TOKEN_REJECTED, ...(held ? {} : { superseded: true }) };
     }
 
     if (fetched.kind === "transient" || fetched.kind === "fatal") {
-      // Status and lastSyncAt stay untouched so the next cron tick retries the
-      // same window; just record what happened and release the lease.
+      // Status and lastSyncAt stay untouched so the next cron tick retries;
+      // record what happened and release the lease. A fatal while resuming
+      // also drops the cursor (Shopify cursors go stale), falling back to the
+      // plain window path next tick.
       const detail = clip(fetched.detail);
-      if (fetched.kind === "fatal" && detail !== connection.lastError) {
-        // Only the first occurrence of a given failure gets an activity event;
-        // a cron retrying every tick must not spam the feed.
-        await db.insert(events).values({
-          id: crypto.randomUUID(),
-          workspaceId,
-          orderId: null,
-          type: "sync_error",
-          text: detail,
-          createdAt: now,
-        });
+      const held = await fencedConnectionWrite(db, workspaceId, myLease, {
+        lastError: detail,
+        runningUntil: 0,
+        ...(fetched.kind === "fatal" && resuming
+          ? { syncCursor: null, syncCursorSince: null }
+          : {}),
+      });
+      if (!held) {
+        return { ...empty(), error: fetched.detail, superseded: true };
       }
-      await db
-        .update(storeConnections)
-        .set({ lastError: detail, runningUntil: 0 })
-        .where(eq(storeConnections.workspaceId, workspaceId));
+      if (fetched.kind === "fatal") {
+        // One activity event per failure text per hour, judged against the
+        // event stream itself: lastError flaps on interleaved transient blips
+        // and must not be the dedup key.
+        const recent = await db
+          .select({ createdAt: events.createdAt })
+          .from(events)
+          .where(
+            and(
+              eq(events.workspaceId, workspaceId),
+              eq(events.type, "sync_error"),
+              eq(events.text, detail),
+            ),
+          )
+          .orderBy(desc(events.createdAt))
+          .limit(1);
+        if (!recent[0] || recent[0].createdAt < now - SYNC_ERROR_EVENT_WINDOW_MS) {
+          await db.insert(events).values({
+            id: crypto.randomUUID(),
+            workspaceId,
+            orderId: null,
+            type: "sync_error",
+            text: detail,
+            createdAt: now,
+          });
+        }
+      }
       return { ...empty(), error: fetched.detail };
     }
 
@@ -193,21 +279,23 @@ export async function runSync(
       const rows = await db
         .select({ id: orders.id, shopifyOrderId: orders.shopifyOrderId, shopify: orders.shopify })
         .from(orders)
-        .where(
-          and(eq(orders.workspaceId, workspaceId), inArray(orders.shopifyOrderId, chunk)),
-        );
+        .where(and(eq(orders.workspaceId, workspaceId), inArray(orders.shopifyOrderId, chunk)));
       for (const row of rows) {
         existingByShopifyId.set(row.shopifyOrderId, { id: row.id, shopify: row.shopify });
       }
     }
+
+    const addedSet = new Set<string>();
+    const updatedSet = new Set<string>();
 
     for (const order of normalized) {
       const existing = existingByShopifyId.get(order.shopifyOrderId);
 
       if (!existing) {
         const orderId = crypto.randomUUID();
-        // Both inserts are conflict no-ops and the event id is deterministic,
-        // so a replay of this pair cannot double-insert anything.
+        // Both inserts are conflict no-ops and the event id is deterministic
+        // across runs (workspace + Shopify order), so a racing run that lost
+        // inserts nothing and is detected by rows-affected below.
         const insertOrder = db
           .insert(orders)
           .values({
@@ -224,7 +312,7 @@ export async function runSync(
         const insertEvent = db
           .insert(events)
           .values({
-            id: `evt-order-new-${orderId}`,
+            id: `evt-order-new-${workspaceId}-${order.shopifyOrderId}`,
             workspaceId,
             orderId,
             type: "order_new",
@@ -233,10 +321,13 @@ export async function runSync(
             createdAt: now,
           })
           .onConflictDoNothing();
-        await applyPair(db, insertOrder, insertEvent);
-        added++;
-        addedOrderIds.push(orderId);
-        existingByShopifyId.set(order.shopifyOrderId, { id: orderId, shopify: order });
+        const [orderInsertResult] = await applyPair(db, insertOrder, insertEvent);
+        if (changesOf(orderInsertResult) === 1) {
+          added++;
+          addedOrderIds.push(orderId);
+          addedSet.add(orderId);
+          existingByShopifyId.set(order.shopifyOrderId, { id: orderId, shopify: order });
+        }
       } else if (JSON.stringify(existing.shopify) !== JSON.stringify(order)) {
         // Stable diff: normalizeOrders builds keys in one fixed order and JSON
         // parse/stringify round-trips preserve it, so equal snapshots always
@@ -248,37 +339,76 @@ export async function runSync(
           .update(orders)
           .set({ shopify: order, syncedAt: now })
           .where(eq(orders.id, existing.id));
-        updated++;
-        updatedOrderIds.push(existing.id);
+        // An id added this run stays out of updatedOrderIds: a later duplicate
+        // in the same payload refines the new order, it does not "update" it.
+        if (!addedSet.has(existing.id) && !updatedSet.has(existing.id)) {
+          updated++;
+          updatedOrderIds.push(existing.id);
+          updatedSet.add(existing.id);
+        }
         existingByShopifyId.set(order.shopifyOrderId, { id: existing.id, shopify: order });
       }
     }
 
-    // A truncated fetch stops at the page cap, so anchor lastSyncAt at the
-    // newest updatedAt actually gathered: ascending UPDATED_AT sort means the
-    // next tick's window picks up exactly where this one stopped, and nothing
-    // between watermark and now is silently skipped.
-    const watermarkMs =
-      fetched.truncated && fetched.maxUpdatedAt ? Date.parse(fetched.maxUpdatedAt) : NaN;
-    await db
-      .update(storeConnections)
-      .set({
-        lastSyncAt: Number.isNaN(watermarkMs) ? now : watermarkMs,
+    let terminal: ConnectionWrite;
+    if (fetched.truncated && fetched.endCursor) {
+      // Stopped at the page cap: persist the cursor and its window; progress
+      // is carried by the cursor, so lastSyncAt stays untouched until the
+      // window is fully drained.
+      terminal = {
+        syncCursor: fetched.endCursor,
+        syncCursorSince: sinceMs,
         runningUntil: 0,
         status: "ok",
         lastError: null,
-      })
-      .where(eq(storeConnections.workspaceId, workspaceId));
-
-    return { added, updated, addedOrderIds, updatedOrderIds };
+      };
+    } else {
+      // Window complete (or truncated with no cursor to resume from, where
+      // the watermark is the only anchor). Anchoring rules:
+      // - completed cursor continuation: the max updatedAt seen (ascending
+      //   sort makes the final tick's max the max of the whole continuation),
+      //   falling back to the previous lastSyncAt, never now;
+      // - truncated without cursor: the watermark (client guarantees one);
+      // - plain completed window: now.
+      const watermarkMs = fetched.maxUpdatedAt ? Date.parse(fetched.maxUpdatedAt) : NaN;
+      const anchor =
+        fetched.truncated || resuming
+          ? Number.isNaN(watermarkMs)
+            ? connection.lastSyncAt
+            : watermarkMs
+          : now;
+      terminal = {
+        lastSyncAt: anchor,
+        syncCursor: null,
+        syncCursorSince: null,
+        runningUntil: 0,
+        status: "ok",
+        lastError: null,
+      };
+    }
+    const held = await fencedConnectionWrite(db, workspaceId, myLease, terminal);
+    return {
+      added,
+      updated,
+      addedOrderIds,
+      updatedOrderIds,
+      ...(held ? {} : { superseded: true }),
+    };
   } catch (e) {
     // Unexpected throw: release the lease and surface the message; the counts
     // so far go back so callers can still broadcast what landed.
     const message = clip(e instanceof Error ? e.message : "sync failed unexpectedly");
-    await db
-      .update(storeConnections)
-      .set({ lastError: message, runningUntil: 0 })
-      .where(eq(storeConnections.workspaceId, workspaceId));
-    return { added, updated, addedOrderIds, updatedOrderIds, error: message };
+    const held = await fencedConnectionWrite(db, workspaceId, myLease, {
+      lastError: message,
+      runningUntil: 0,
+    });
+    return {
+      added,
+      updated,
+      addedOrderIds,
+      updatedOrderIds,
+      error: message,
+      ...(held ? {} : { superseded: true }),
+    };
   }
 }

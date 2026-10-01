@@ -5,17 +5,37 @@
 export const SHOPIFY_API_VERSION = "2025-07";
 
 export type ShopifyFetchResult =
-  | { kind: "ok"; nodes: unknown[]; truncated: boolean; maxUpdatedAt: string | null }
+  | {
+      kind: "ok";
+      nodes: unknown[];
+      // True when more matching orders exist beyond what was gathered (page
+      // cap, or a missing continuation cursor). endCursor is where pagination
+      // stopped, for cross-tick resumption; maxUpdatedAt is the newest
+      // updatedAt gathered, the fallback window anchor.
+      truncated: boolean;
+      maxUpdatedAt: string | null;
+      endCursor: string | null;
+    }
   | { kind: "auth" }
   | { kind: "transient"; detail: string }
   | { kind: "fatal"; detail: string };
+
+export type FetchOrdersOptions = {
+  // Resume pagination from a cursor persisted by an earlier truncated run.
+  startCursor?: string;
+};
 
 // Anchored allowlist for the host that receives the token. Anything else is
 // rejected before fetch, so a tampered shop_domain row cannot exfiltrate the
 // token to an arbitrary host.
 const SHOP_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/;
 
+// The since window is interpolated into a search string, so only a strict
+// UTC ISO timestamp is accepted.
+const SINCE_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/;
+
 const MAX_PAGES = 10;
+const REQUEST_TIMEOUT_MS = 90000;
 
 // Both the cursor and the updated_at search ride as GraphQL variables, so no
 // runtime value is ever spliced into the query document itself.
@@ -67,24 +87,30 @@ export async function fetchOrdersUpdatedSince(
   token: string,
   sinceIso: string,
   fetchImpl: typeof fetch = fetch,
+  opts?: FetchOrdersOptions,
 ): Promise<ShopifyFetchResult> {
   if (!SHOP_DOMAIN.test(shopDomain)) {
     return { kind: "fatal", detail: "invalid shop domain" };
+  }
+  if (!SINCE_ISO.test(sinceIso)) {
+    return { kind: "fatal", detail: "invalid since timestamp" };
   }
 
   const url = `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
   const search = `updated_at:>='${sinceIso}'`;
   const nodes: unknown[] = [];
-  let cursor: string | null = null;
+  let cursor: string | null = opts?.startCursor ?? null;
   let maxUpdatedAt: string | null = null;
   let maxUpdatedAtMs = -Infinity;
 
-  const ok = (truncated: boolean): ShopifyFetchResult => ({
-    kind: "ok",
-    nodes,
-    truncated,
-    maxUpdatedAt,
-  });
+  const ok = (truncated: boolean, endCursor: string | null): ShopifyFetchResult => {
+    if (truncated && maxUpdatedAt === null) {
+      // Without a watermark the caller has no safe window anchor and no way
+      // to verify progress; retry the whole window on the next tick instead.
+      return { kind: "transient", detail: "truncated response with no usable updatedAt watermark" };
+    }
+    return { kind: "ok", nodes, truncated, maxUpdatedAt, endCursor };
+  };
 
   for (let page = 0; page < MAX_PAGES; page++) {
     let response: Response;
@@ -96,8 +122,16 @@ export async function fetchOrdersUpdatedSince(
           "content-type": "application/json",
         },
         body: JSON.stringify({ query: ORDERS_QUERY, variables: { cursor, search } }),
+        // Never follow a redirect: the default would re-send the access token
+        // to whatever host the redirect names.
+        redirect: "manual",
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (e) {
+      const name = typeof e === "object" && e !== null ? (e as { name?: unknown }).name : undefined;
+      if (name === "TimeoutError" || name === "AbortError") {
+        return { kind: "transient", detail: "Shopify request timed out" };
+      }
       const message = e instanceof Error ? e.message : "fetch threw";
       return { kind: "transient", detail: scrub(`network error: ${message}`, token) };
     }
@@ -130,12 +164,16 @@ export async function fetchOrdersUpdatedSince(
     }
 
     const orders = isRecord(body) && isRecord(body.data) ? body.data.orders : undefined;
-    if (!isRecord(orders)) {
+    if (
+      !isRecord(orders) ||
+      !Array.isArray(orders.nodes) ||
+      !isRecord(orders.pageInfo) ||
+      typeof orders.pageInfo.hasNextPage !== "boolean"
+    ) {
       return { kind: "transient", detail: "unexpected response shape" };
     }
 
-    const pageNodes = Array.isArray(orders.nodes) ? orders.nodes : [];
-    for (const node of pageNodes) {
+    for (const node of orders.nodes) {
       nodes.push(node);
       const updatedAt = isRecord(node) && typeof node.updatedAt === "string" ? node.updatedAt : "";
       const updatedAtMs = Date.parse(updatedAt);
@@ -145,20 +183,20 @@ export async function fetchOrdersUpdatedSince(
       }
     }
 
-    const pageInfo = isRecord(orders.pageInfo) ? orders.pageInfo : undefined;
-    if (pageInfo?.hasNextPage !== true) {
-      return ok(false);
+    const pageInfo = orders.pageInfo;
+    if (pageInfo.hasNextPage !== true) {
+      return ok(false, null);
     }
     if (typeof pageInfo.endCursor !== "string") {
-      // More pages exist but no cursor to reach them: report truncation so
-      // the caller anchors the next window at the watermark.
-      return ok(true);
+      // More pages exist but no cursor to reach them: report truncation with
+      // no resumption cursor; the caller falls back to watermark anchoring.
+      return ok(true, null);
     }
     cursor = pageInfo.endCursor;
   }
 
-  // Page cap reached with more pages remaining: truncated plus the updatedAt
-  // watermark lets the caller continue from here on the next tick (the query
-  // sorts ascending by UPDATED_AT, so nothing before the watermark was missed).
-  return ok(true);
+  // Page cap reached with more pages remaining: the caller persists endCursor
+  // and resumes this exact window next tick, so dense updatedAt clusters
+  // (hundreds of orders sharing one second) cannot livelock the sync.
+  return ok(true, cursor);
 }

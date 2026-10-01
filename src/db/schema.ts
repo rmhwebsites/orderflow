@@ -32,6 +32,12 @@ export const storeConnections = sqliteTable("store_connections", {
   lastManualSyncAt: integer("last_manual_sync_at").notNull().default(0),
   runningUntil: integer("running_until").notNull().default(0),
   lastError: text("last_error"),
+  // Cross-tick pagination state: when a fetch stops at the page cap, the
+  // Shopify cursor and the exact since window it belongs to are persisted so
+  // the next tick resumes mid-window instead of re-anchoring on a watermark
+  // (which livelocks when 500+ orders share one updatedAt second).
+  syncCursor: text("sync_cursor"),
+  syncCursorSince: integer("sync_cursor_since"),
 });
 
 export const statuses = sqliteTable("statuses", {

@@ -59,6 +59,7 @@ describe("fetchOrdersUpdatedSince", () => {
       nodes,
       truncated: false,
       maxUpdatedAt: "2026-09-14T09:15:40Z",
+      endCursor: null,
     });
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe(`https://${DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`);
@@ -91,6 +92,7 @@ describe("fetchOrdersUpdatedSince", () => {
       nodes: [...first, ...second],
       truncated: false,
       maxUpdatedAt: "2026-09-11T00:00:00Z",
+      endCursor: null,
     });
     expect(calls).toHaveLength(2);
     expect(variablesOf(calls[0]).cursor).toBeNull();
@@ -116,6 +118,7 @@ describe("fetchOrdersUpdatedSince", () => {
       expect(result.nodes).toHaveLength(10);
       expect(result.truncated).toBe(true);
       expect(result.maxUpdatedAt).toBe(new Date(base + 9 * 60000).toISOString());
+      expect(result.endCursor).toBe("cursor-9");
     }
   });
 
@@ -123,7 +126,102 @@ describe("fetchOrdersUpdatedSince", () => {
     const nodes = [{ id: "gid://shopify/Order/1" }, { id: "gid://shopify/Order/2", updatedAt: 7 }];
     const { impl } = stubFetch([ordersPage(nodes, { hasNextPage: false, endCursor: null })]);
     const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
-    expect(result).toEqual({ kind: "ok", nodes, truncated: false, maxUpdatedAt: null });
+    expect(result).toEqual({
+      kind: "ok",
+      nodes,
+      truncated: false,
+      maxUpdatedAt: null,
+      endCursor: null,
+    });
+  });
+
+  it("starts pagination from a provided cursor", async () => {
+    const nodes = [{ id: "gid://shopify/Order/9", updatedAt: "2026-09-14T09:15:40Z" }];
+    const { impl, calls } = stubFetch([ordersPage(nodes, { hasNextPage: false, endCursor: null })]);
+    const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl, {
+      startCursor: "resume-here",
+    });
+    expect(result.kind).toBe("ok");
+    expect(variablesOf(calls[0]).cursor).toBe("resume-here");
+    expect(variablesOf(calls[0]).search).toBe(SEARCH);
+  });
+
+  it("returns transient when truncated with no usable watermark (capped path)", async () => {
+    const script = Array.from({ length: 12 }, (_, i) =>
+      ordersPage([{ id: `gid://shopify/Order/${i}` }], {
+        hasNextPage: true,
+        endCursor: `cursor-${i}`,
+      }),
+    );
+    const { impl } = stubFetch(script);
+    const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
+    expect(result).toEqual({
+      kind: "transient",
+      detail: "truncated response with no usable updatedAt watermark",
+    });
+  });
+
+  it("returns transient when truncated with no usable watermark (missing cursor path)", async () => {
+    const { impl } = stubFetch([
+      ordersPage([{ id: "gid://shopify/Order/1" }], { hasNextPage: true, endCursor: null }),
+    ]);
+    const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
+    expect(result).toEqual({
+      kind: "transient",
+      detail: "truncated response with no usable updatedAt watermark",
+    });
+  });
+
+  it("reports truncation with a null endCursor when more pages exist but no cursor does", async () => {
+    const nodes = [{ id: "gid://shopify/Order/1", updatedAt: "2026-09-14T09:15:40Z" }];
+    const { impl } = stubFetch([ordersPage(nodes, { hasNextPage: true, endCursor: null })]);
+    const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
+    expect(result).toEqual({
+      kind: "ok",
+      nodes,
+      truncated: true,
+      maxUpdatedAt: "2026-09-14T09:15:40Z",
+      endCursor: null,
+    });
+  });
+
+  it("rejects deeper malformed order containers as transient", async () => {
+    const bodies = [
+      { data: { orders: {} } },
+      { data: { orders: { nodes: null, pageInfo: { hasNextPage: false, endCursor: null } } } },
+      { data: { orders: { nodes: [], pageInfo: "corrupt" } } },
+      { data: { orders: { nodes: [], pageInfo: { hasNextPage: "yes" } } } },
+    ];
+    for (const body of bodies) {
+      const { impl } = stubFetch([jsonResponse(body)]);
+      const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
+      expect(result).toEqual({ kind: "transient", detail: "unexpected response shape" });
+    }
+  });
+
+  it("requests with manual redirect handling and a timeout signal", async () => {
+    const { impl, calls } = stubFetch([ordersPage([], { hasNextPage: false, endCursor: null })]);
+    await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
+    expect(calls[0].init.redirect).toBe("manual");
+    expect(calls[0].init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("maps an aborted request to a timeout transient", async () => {
+    const impl = (async () => {
+      throw new DOMException("The operation timed out", "TimeoutError");
+    }) as typeof fetch;
+    const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
+    expect(result).toEqual({ kind: "transient", detail: "Shopify request timed out" });
+  });
+
+  it("rejects an invalid since timestamp without ever calling fetch", async () => {
+    const badSince = ["2026-08-01 00:00:00", "not-a-date", "2026-08-01T00:00:00+02:00", ""];
+    for (const since of badSince) {
+      const { impl, calls } = stubFetch([]);
+      const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, since, impl);
+      expect(result).toEqual({ kind: "fatal", detail: "invalid since timestamp" });
+      expect(calls).toHaveLength(0);
+    }
   });
 
   it("classifies 401 and 403 as auth", async () => {

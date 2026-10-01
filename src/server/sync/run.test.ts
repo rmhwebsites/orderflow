@@ -4,12 +4,12 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { drizzle } from "drizzle-orm/better-sqlite3";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "../../db";
 import * as schema from "../../db/schema";
 import { encryptSecret } from "../crypto";
 import fixture from "../shopify/__fixtures__/orders-graphql.json";
-import { runSync, applyPair } from "./run";
+import { runSync, applyPair, EXISTENCE_CHUNK } from "./run";
 import { runAllSyncs } from "./cron";
 
 // runSync against a real migrated SQLite database. @cloudflare/vitest-pool-workers
@@ -167,6 +167,78 @@ function errorsFetch(errors: unknown[]) {
   return { impl };
 }
 
+type SimOrder = { idNum: number; updatedAtMs: number };
+
+// Window-honoring Shopify simulator (adapted from the review repro harness):
+// filters the dataset by the updated_at search window, sorts ascending by
+// (updated_at, id) like the Admin API's stable tie-break, pages 50 at a time,
+// and optionally rejects any cursor to simulate staleness.
+function shopifySim(dataset: SimOrder[], opts?: { rejectCursors?: boolean }) {
+  let requests = 0;
+  const impl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    requests++;
+    const vars = (JSON.parse(String(init?.body ?? "{}")) as {
+      variables: { cursor: string | null; search: string };
+    }).variables;
+    if (vars.cursor !== null && opts?.rejectCursors) {
+      return new Response(
+        JSON.stringify({ errors: [{ message: `cursor ${vars.cursor} is invalid` }] }),
+        { status: 200 },
+      );
+    }
+    const sinceMs = Date.parse(vars.search.match(/'(.*)'/)![1]);
+    const windowed = dataset
+      .filter((o) => o.updatedAtMs >= sinceMs)
+      .sort((a, b) => a.updatedAtMs - b.updatedAtMs || a.idNum - b.idNum);
+    const start = vars.cursor ? parseInt(vars.cursor.slice(4), 10) : 0;
+    const page = windowed.slice(start, start + 50);
+    const end = start + page.length;
+    const nodes = page.map((o) => ({
+      id: `gid://shopify/Order/${o.idNum}`,
+      legacyResourceId: String(o.idNum),
+      name: `#${o.idNum}`,
+      createdAt: new Date(o.updatedAtMs - 1000).toISOString(),
+      updatedAt: new Date(o.updatedAtMs).toISOString(),
+      tags: [],
+      lineItems: { nodes: [] },
+    }));
+    return new Response(
+      JSON.stringify({
+        data: {
+          orders: {
+            nodes,
+            pageInfo: { hasNextPage: end < windowed.length, endCursor: `idx:${end}` },
+          },
+        },
+      }),
+      { status: 200 },
+    );
+  }) as typeof fetch;
+  return { impl, count: () => requests };
+}
+
+// Proxy whose existence query sees nothing, simulating a racing run that
+// inserted the same orders after this run built its existence map.
+function withBlindExistenceCheck(db: Db): Db {
+  return new Proxy(db as object, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop);
+      if (prop === "select") {
+        return (...args: unknown[]) => {
+          const fields = args[0] as Record<string, unknown> | undefined;
+          if (fields && "shopifyOrderId" in fields) {
+            return { from: () => ({ where: async () => [] }) };
+          }
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  }) as unknown as Db;
+}
+
 // Proxy that adds a D1-style batch to the better-sqlite3 Db so the batch
 // branch of applyPair runs in-flow.
 function withBatch(db: Db, record: unknown[][]): Db {
@@ -322,12 +394,11 @@ describe("runSync", () => {
     expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
   });
 
-  it("gives the order_new event a deterministic id derived from the order id", async () => {
+  it("gives the order_new event a cross-run deterministic id", async () => {
     const { db, env } = await makeDb();
     await runSync(db, env, WS, { fetchImpl: pageFetch([rileyNode]).impl, now: () => NOW });
-    const [order] = await ordersIn(db, WS);
     const [event] = await eventsIn(db, WS, "order_new");
-    expect(event.id).toBe(`evt-order-new-${order.id}`);
+    expect(event.id).toBe(`evt-order-new-${WS}-6101`);
   });
 
   it("handles the same order twice in one batch: one row, one event, no throw", async () => {
@@ -341,6 +412,61 @@ describe("runSync", () => {
     expect(result.error).toBeUndefined();
     expect(await ordersIn(db, WS)).toHaveLength(1);
     expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
+  });
+
+  it("counts an intra-batch duplicate with a changed snapshot as added only", async () => {
+    const { db, env } = await makeDb();
+    const changed = { ...rileyNode, note: "second copy" };
+    const result = await runSync(db, env, WS, {
+      fetchImpl: pageFetch([rileyNode, changed]).impl,
+      now: () => NOW,
+    });
+    expect(result.added).toBe(1);
+    expect(result.updated).toBe(0);
+    expect(result.addedOrderIds).toHaveLength(1);
+    expect(result.updatedOrderIds).toEqual([]);
+    const rows = await ordersIn(db, WS);
+    expect(rows).toHaveLength(1);
+    // The newest snapshot in the batch still wins.
+    expect((rows[0].shopify as { note: string }).note).toBe("second copy");
+    expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
+  });
+
+  it("a losing racer neither double-counts nor double-events a new order", async () => {
+    const { db, env } = await makeDb();
+    // Winner lands the order and its event first.
+    await runSync(db, env, WS, { fetchImpl: pageFetch([rileyNode]).impl, now: () => NOW });
+    // The loser's existence map was built before the winner's insert.
+    const result = await runSync(withBlindExistenceCheck(db), env, WS, {
+      fetchImpl: pageFetch([rileyNode]).impl,
+      now: () => LATER,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.added).toBe(0);
+    expect(result.addedOrderIds).toEqual([]);
+    expect(await ordersIn(db, WS)).toHaveLength(1);
+    expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
+  });
+
+  it("a superseded run cannot clobber connection state or release the new lease", async () => {
+    const { db, raw, env } = await makeDb();
+    const hijackedLease = NOW + 999999;
+    // Mid-run (after the CAS, before any terminal write) another run takes
+    // over the lease; this run's terminal auth-failure write must not land.
+    const impl = (async () => {
+      raw
+        .prepare("UPDATE store_connections SET running_until = ? WHERE workspace_id = ?")
+        .run(hijackedLease, WS);
+      return new Response("{}", { status: 401 });
+    }) as typeof fetch;
+
+    const result = await runSync(db, env, WS, { fetchImpl: impl, now: () => NOW });
+    expect(result.superseded).toBe(true);
+
+    const connection = await connectionOf(db, WS);
+    expect(connection.status).toBe("ok");
+    expect(connection.lastError).toBeNull();
+    expect(connection.runningUntil).toBe(hijackedLease);
   });
 
   it("clears the lease and records lastError when the write loop throws", async () => {
@@ -502,6 +628,37 @@ describe("runSync", () => {
     expect(await eventsIn(db, WS, "sync_error")).toHaveLength(2);
   });
 
+  it("does not repeat a sync_error event when the same fatal recurs after transient blips", async () => {
+    const { db, env } = await makeDb();
+    await runSync(db, env, WS, {
+      fetchImpl: errorsFetch([{ message: "schema mismatch" }]).impl,
+      now: () => NOW,
+    });
+    // A transient blip rewrites lastError in between.
+    await runSync(db, env, WS, { fetchImpl: statusFetch(503).impl, now: () => NOW + 600000 });
+    await runSync(db, env, WS, {
+      fetchImpl: errorsFetch([{ message: "schema mismatch" }]).impl,
+      now: () => NOW + 1200000,
+    });
+    expect(await eventsIn(db, WS, "sync_error")).toHaveLength(1);
+  });
+
+  it("caps alternating fatal texts at one event each per hour", async () => {
+    const { db, env } = await makeDb();
+    const failWith = (message: string, at: number) =>
+      runSync(db, env, WS, { fetchImpl: errorsFetch([{ message }]).impl, now: () => at });
+
+    await failWith("failure alpha", NOW);
+    await failWith("failure beta", NOW + 600000);
+    await failWith("failure alpha", NOW + 1200000);
+    await failWith("failure beta", NOW + 1800000);
+    expect(await eventsIn(db, WS, "sync_error")).toHaveLength(2);
+
+    // Over an hour after the first alpha event, alpha may be recorded again.
+    await failWith("failure alpha", NOW + 3700000);
+    expect(await eventsIn(db, WS, "sync_error")).toHaveLength(3);
+  });
+
   it("marks the connection when the token cannot be decrypted", async () => {
     const { db, env } = await makeDb({
       encryptedToken: await encryptSecret(FAKE_TOKEN, TEST_KEY, "ws_other"),
@@ -531,41 +688,153 @@ describe("runSync", () => {
     expect(second.calls[0].body.variables?.search).toBe(`updated_at:>='${overlapWindow}'`);
   });
 
-  it("resumes from the updatedAt watermark after a capped run", async () => {
+  it("drains a dense same-second cluster past the page cap via cursor resumption", async () => {
     const { db, env } = await makeDb();
-    const base = Date.parse("2026-09-25T00:00:00.000Z");
-    const nodeAt = (i: number) => ({
-      id: `gid://shopify/Order/${7000 + i}`,
-      legacyResourceId: String(7000 + i),
-      name: `#2${String(i).padStart(3, "0")}`,
-      createdAt: new Date(base + i * 60000).toISOString(),
-      updatedAt: new Date(base + i * 60000).toISOString(),
-      tags: [],
-      lineItems: { nodes: [] },
-    });
+    const T = Date.parse("2026-09-25T12:00:00.000Z");
+    // 600 orders bulk-updated on the same second, plus one genuinely new
+    // order ten minutes later. The watermark approach livelocks here.
+    const dataset: SimOrder[] = [];
+    for (let i = 1; i <= 600; i++) {
+      dataset.push({ idNum: i, updatedAtMs: T });
+    }
+    dataset.push({ idNum: 9999, updatedAtMs: T + 600000 });
+    await db
+      .update(schema.storeConnections)
+      .set({ lastSyncAt: T - 3600000 })
+      .where(eq(schema.storeConnections.workspaceId, WS));
 
-    // 11 pages of data exist; the client gathers 10 and reports truncation.
-    const first = scriptedFetch(
-      Array.from({ length: 10 }, (_, i) => ({
-        nodes: [nodeAt(i)],
-        hasNextPage: true,
-        endCursor: `c${i}`,
-      })),
-    );
-    const r1 = await runSync(db, env, WS, { fetchImpl: first.impl, now: () => NOW });
-    expect(r1.added).toBe(10);
-    const watermark = nodeAt(9).updatedAt;
-    expect((await connectionOf(db, WS)).lastSyncAt).toBe(Date.parse(watermark));
+    const sim = shopifySim(dataset);
+    let totalAdded = 0;
+    for (let tick = 1; tick <= 3; tick++) {
+      const result = await runSync(db, env, WS, {
+        fetchImpl: sim.impl,
+        now: () => T + (10 + tick * 10) * 60000,
+      });
+      expect(result.error).toBeUndefined();
+      totalAdded += result.added;
+    }
 
-    // The next window anchors at the watermark (minus the safety overlap),
-    // not at the wall clock, so the capped remainder is fetched.
-    const second = scriptedFetch([{ nodes: [nodeAt(10)], hasNextPage: false }]);
-    const r2 = await runSync(db, env, WS, { fetchImpl: second.impl, now: () => LATER });
-    const expectedSince = new Date(Date.parse(watermark) - OVERLAP_MS).toISOString();
-    expect(second.calls[0].body.variables?.search).toBe(`updated_at:>='${expectedSince}'`);
-    expect(r2.added).toBe(1);
-    expect(await ordersIn(db, WS)).toHaveLength(11);
-    expect((await connectionOf(db, WS)).lastSyncAt).toBe(LATER);
+    expect(totalAdded).toBe(601);
+    const rows = await ordersIn(db, WS);
+    expect(rows).toHaveLength(601);
+    expect(rows.some((o) => o.shopifyOrderId === "9999")).toBe(true);
+    const connection = await connectionOf(db, WS);
+    expect(connection.status).toBe("ok");
+    expect(connection.syncCursor).toBeNull();
+    expect(connection.syncCursorSince).toBeNull();
+  });
+
+  it("persists the cursor on truncation and leaves lastSyncAt untouched", async () => {
+    const { db, env } = await makeDb();
+    const T = Date.parse("2026-09-25T12:00:00.000Z");
+    const previousSync = T - 3600000;
+    const dataset: SimOrder[] = Array.from({ length: 620 }, (_, i) => ({
+      idNum: i + 1,
+      updatedAtMs: T + (i + 1) * 60000,
+    }));
+    await db
+      .update(schema.storeConnections)
+      .set({ lastSyncAt: previousSync })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    const sim = shopifySim(dataset);
+    const r1 = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => T + 700 * 60000 });
+    expect(r1.added).toBe(500);
+    const afterTruncated = await connectionOf(db, WS);
+    expect(afterTruncated.syncCursor).toBe("idx:500");
+    expect(afterTruncated.syncCursorSince).toBe(previousSync - OVERLAP_MS);
+    expect(afterTruncated.lastSyncAt).toBe(previousSync);
+    expect(afterTruncated.status).toBe("ok");
+
+    // The continuation reuses the persisted window, not a fresh one.
+    const r2 = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => T + 701 * 60000 });
+    expect(r2.added).toBe(120);
+    const afterComplete = await connectionOf(db, WS);
+    expect(afterComplete.syncCursor).toBeNull();
+    expect(afterComplete.syncCursorSince).toBeNull();
+    // Completed continuation anchors at the max updatedAt seen, never at now.
+    expect(afterComplete.lastSyncAt).toBe(T + 620 * 60000);
+    expect(await ordersIn(db, WS)).toHaveLength(620);
+  });
+
+  it("never regresses lastSyncAt by more than the overlap and keeps every order", async () => {
+    const { db, env } = await makeDb();
+    const T = Date.parse("2026-09-25T12:00:00.000Z");
+    // A burst of 550 orders inside the overlap window just behind lastSyncAt.
+    const dataset: SimOrder[] = Array.from({ length: 550 }, (_, i) => ({
+      idNum: i + 1,
+      updatedAtMs: T - 240000 + Math.floor((i + 1) / 3) * 1000,
+    }));
+    await db
+      .update(schema.storeConnections)
+      .set({ lastSyncAt: T })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    const sim = shopifySim(dataset);
+    let lastResult;
+    for (let tick = 1; tick <= 4; tick++) {
+      const before = (await connectionOf(db, WS)).lastSyncAt;
+      lastResult = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => T + tick * 600000 });
+      expect(lastResult.error).toBeUndefined();
+      const after = (await connectionOf(db, WS)).lastSyncAt;
+      expect(after).toBeGreaterThanOrEqual(before - OVERLAP_MS);
+    }
+    expect(await ordersIn(db, WS)).toHaveLength(550);
+    expect(lastResult?.added).toBe(0);
+  });
+
+  it("recovers when Shopify rejects a persisted cursor", async () => {
+    const { db, env } = await makeDb();
+    const T = Date.parse("2026-09-25T12:00:00.000Z");
+    const previousSync = T - 3600000;
+    const dataset: SimOrder[] = Array.from({ length: 620 }, (_, i) => ({
+      idNum: i + 1,
+      updatedAtMs: T + (i + 1) * 60000,
+    }));
+    await db
+      .update(schema.storeConnections)
+      .set({ lastSyncAt: previousSync })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    const honest = shopifySim(dataset);
+    const r1 = await runSync(db, env, WS, { fetchImpl: honest.impl, now: () => T + 700 * 60000 });
+    expect(r1.added).toBe(500);
+    expect((await connectionOf(db, WS)).syncCursor).toBe("idx:500");
+
+    // The persisted cursor has gone stale: Shopify rejects it (fatal).
+    const rejecting = shopifySim(dataset, { rejectCursors: true });
+    const r2 = await runSync(db, env, WS, { fetchImpl: rejecting.impl, now: () => T + 701 * 60000 });
+    expect(r2.error).toContain("cursor");
+    const afterReject = await connectionOf(db, WS);
+    expect(afterReject.syncCursor).toBeNull();
+    expect(afterReject.syncCursorSince).toBeNull();
+    expect(afterReject.lastError).toContain("cursor");
+    expect(afterReject.lastSyncAt).toBe(previousSync);
+
+    // Next ticks fall back to the plain window path and still drain the rest.
+    await runSync(db, env, WS, { fetchImpl: honest.impl, now: () => T + 702 * 60000 });
+    await runSync(db, env, WS, { fetchImpl: honest.impl, now: () => T + 703 * 60000 });
+    expect(await ordersIn(db, WS)).toHaveLength(620);
+    expect((await connectionOf(db, WS)).syncCursor).toBeNull();
+  });
+
+  it("keeps a full existence chunk within the D1 bound-parameter limit", () => {
+    const { db } = openDb();
+    expect(EXISTENCE_CHUNK).toBe(50);
+    const chunk = Array.from({ length: EXISTENCE_CHUNK }, (_, i) => String(9000 + i));
+    const query = db
+      .select({
+        id: schema.orders.id,
+        shopifyOrderId: schema.orders.shopifyOrderId,
+        shopify: schema.orders.shopify,
+      })
+      .from(schema.orders)
+      .where(
+        and(eq(schema.orders.workspaceId, WS), inArray(schema.orders.shopifyOrderId, chunk)),
+      );
+    const bound = query.toSQL().params.length;
+    expect(bound).toBe(EXISTENCE_CHUNK + 1);
+    expect(bound).toBeLessThanOrEqual(100);
   });
 
   it("falls back to status key new when the workspace has no statuses", async () => {
@@ -612,10 +881,10 @@ describe("runSync", () => {
 
 describe("applyPair", () => {
   it("routes both statements through db.batch without awaiting them individually", async () => {
-    const batch = vi.fn(async () => []);
+    const batch = vi.fn(async () => ["order-result", "event-result"]);
     const a = { then: vi.fn() };
     const b = { then: vi.fn() };
-    await applyPair(
+    const results = await applyPair(
       { batch } as unknown as Db,
       a as unknown as PromiseLike<unknown>,
       b as unknown as PromiseLike<unknown>,
@@ -624,19 +893,21 @@ describe("applyPair", () => {
     expect(batch).toHaveBeenCalledWith([a, b]);
     expect(a.then).not.toHaveBeenCalled();
     expect(b.then).not.toHaveBeenCalled();
+    expect(results).toEqual(["order-result", "event-result"]);
   });
 
-  it("awaits the statements in order when batch is unavailable", async () => {
+  it("awaits the statements in order and returns their results when batch is unavailable", async () => {
     const executed: string[] = [];
     const statement = (name: string) =>
       ({
         then: (resolve: (value: unknown) => void) => {
           executed.push(name);
-          resolve(undefined);
+          resolve(`${name}-result`);
         },
       }) as PromiseLike<unknown>;
-    await applyPair({} as Db, statement("order"), statement("event"));
+    const results = await applyPair({} as Db, statement("order"), statement("event"));
     expect(executed).toEqual(["order", "event"]);
+    expect(results).toEqual(["order-result", "event-result"]);
   });
 });
 

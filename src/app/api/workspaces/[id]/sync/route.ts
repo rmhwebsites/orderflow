@@ -62,9 +62,11 @@ export async function POST(_request: Request, context: RouteContext) {
 
     const { env } = getCloudflareContext();
     const result = await runSync(db, env, id);
-    // The cooldown only counts runs that actually happened: a skipped run
-    // (lease held, no connection, disabled) can be retried immediately.
-    if (connection && !result.skipped) {
+    // The cooldown only counts runs that did real work: skipped runs (lease
+    // held, no connection, disabled) and fruitless failures can be retried
+    // immediately.
+    const fruitlessError = Boolean(result.error) && result.added + result.updated === 0;
+    if (connection && !result.skipped && !fruitlessError) {
       await db
         .update(storeConnections)
         .set({ lastManualSyncAt: now })
@@ -74,8 +76,12 @@ export async function POST(_request: Request, context: RouteContext) {
     // result.updatedOrderIds here.
 
     if (result.error) {
-      // 502 so the connection card can surface the failure text.
-      return NextResponse.json({ error: result.error }, { status: 502 });
+      // 502 with the partial counts so the connection card can surface both
+      // the failure text and what still landed.
+      return NextResponse.json(
+        { error: result.error, added: result.added, updated: result.updated },
+        { status: 502 },
+      );
     }
     // 200 even for skipped results; the card renders the skip reason.
     return NextResponse.json(result);
