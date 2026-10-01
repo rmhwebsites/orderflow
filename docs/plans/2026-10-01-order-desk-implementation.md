@@ -575,3 +575,4 @@ Commit `docs: operations README`.
 - Shopify API version: pin `2025-07`; bump deliberately.
 - esbuild is a direct devDependency on purpose: opennextjs-cloudflare imports it undeclared and vite 8 lists it as an optional peer; do not prune it.
 - npm/cli#4828: any `npm install <pkg>` can silently drop @rolldown/binding-* (and other optional-deps matrices) from the lockfile. After EVERY dependency change: rm -rf node_modules package-lock.json, npm install, then grep -c '\"node_modules/@rolldown/binding-' package-lock.json (expect >= 15) before committing.
+- Test debt: sync route handlers (cooldown boundary, 429/502 mapping, GET shape) lack direct tests; cover when Phase 5 touches the route.

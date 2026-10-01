@@ -5,7 +5,7 @@
 export const SHOPIFY_API_VERSION = "2025-07";
 
 export type ShopifyFetchResult =
-  | { kind: "ok"; nodes: unknown[] }
+  | { kind: "ok"; nodes: unknown[]; truncated: boolean; maxUpdatedAt: string | null }
   | { kind: "auth" }
   | { kind: "transient"; detail: string }
   | { kind: "fatal"; detail: string };
@@ -17,10 +17,11 @@ const SHOP_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/;
 
 const MAX_PAGES = 10;
 
-function ordersQuery(sinceIso: string): string {
-  return `
-query OrdersUpdatedSince($cursor: String) {
-  orders(first: 50, after: $cursor, sortKey: UPDATED_AT, query: "updated_at:>='${sinceIso}'") {
+// Both the cursor and the updated_at search ride as GraphQL variables, so no
+// runtime value is ever spliced into the query document itself.
+const ORDERS_QUERY = `
+query OrdersUpdatedSince($cursor: String, $search: String) {
+  orders(first: 50, after: $cursor, sortKey: UPDATED_AT, query: $search) {
     nodes {
       id
       legacyResourceId
@@ -41,6 +42,9 @@ query OrdersUpdatedSince($cursor: String) {
     pageInfo { hasNextPage endCursor }
   }
 }`;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 // Detail strings can carry text that originated outside this worker (error
@@ -49,15 +53,14 @@ function scrub(detail: string, token: string): string {
   return token.length > 0 ? detail.split(token).join("[redacted]") : detail;
 }
 
-type OrdersPage = {
-  data?: {
-    orders?: {
-      nodes?: unknown;
-      pageInfo?: { hasNextPage?: unknown; endCursor?: unknown };
-    };
-  };
-  errors?: unknown;
-};
+// Shopify signals rate limiting as a GraphQL error carrying extensions.code
+// THROTTLED; a message merely mentioning the word does not count.
+function isThrottled(errors: unknown[]): boolean {
+  return errors.some(
+    (error) =>
+      isRecord(error) && isRecord(error.extensions) && error.extensions.code === "THROTTLED",
+  );
+}
 
 export async function fetchOrdersUpdatedSince(
   shopDomain: string,
@@ -70,9 +73,18 @@ export async function fetchOrdersUpdatedSince(
   }
 
   const url = `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
-  const query = ordersQuery(sinceIso);
+  const search = `updated_at:>='${sinceIso}'`;
   const nodes: unknown[] = [];
   let cursor: string | null = null;
+  let maxUpdatedAt: string | null = null;
+  let maxUpdatedAtMs = -Infinity;
+
+  const ok = (truncated: boolean): ShopifyFetchResult => ({
+    kind: "ok",
+    nodes,
+    truncated,
+    maxUpdatedAt,
+  });
 
   for (let page = 0; page < MAX_PAGES; page++) {
     let response: Response;
@@ -83,7 +95,7 @@ export async function fetchOrdersUpdatedSince(
           "X-Shopify-Access-Token": token,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ query, variables: { cursor } }),
+        body: JSON.stringify({ query: ORDERS_QUERY, variables: { cursor, search } }),
       });
     } catch (e) {
       const message = e instanceof Error ? e.message : "fetch threw";
@@ -93,21 +105,22 @@ export async function fetchOrdersUpdatedSince(
     if (response.status === 401 || response.status === 403) {
       return { kind: "auth" };
     }
-    if (response.status === 429 || response.status >= 500) {
+    // Anything else outside 2xx (429, 5xx, but also 3xx/4xx surprises) is
+    // retried on the next tick rather than parsed into a false green.
+    if (response.status < 200 || response.status >= 300) {
       return { kind: "transient", detail: `Shopify responded with HTTP ${response.status}` };
     }
 
-    let body: OrdersPage;
+    let body: unknown;
     try {
-      body = (await response.json()) as OrdersPage;
+      body = await response.json();
     } catch {
       return { kind: "transient", detail: "Shopify returned invalid JSON" };
     }
 
-    const errors = body?.errors;
+    const errors = isRecord(body) ? body.errors : undefined;
     if (Array.isArray(errors) && errors.length > 0) {
-      // Shopify signals rate limiting as a GraphQL error with code THROTTLED.
-      if (JSON.stringify(errors).includes("THROTTLED")) {
+      if (isThrottled(errors)) {
         return { kind: "transient", detail: "Shopify throttled the request" };
       }
       const first = errors[0] as { message?: unknown } | null;
@@ -116,18 +129,36 @@ export async function fetchOrdersUpdatedSince(
       return { kind: "fatal", detail: scrub(message, token) };
     }
 
-    const orders = body?.data?.orders;
-    if (Array.isArray(orders?.nodes)) {
-      nodes.push(...orders.nodes);
+    const orders = isRecord(body) && isRecord(body.data) ? body.data.orders : undefined;
+    if (!isRecord(orders)) {
+      return { kind: "transient", detail: "unexpected response shape" };
     }
-    const pageInfo = orders?.pageInfo;
-    if (pageInfo?.hasNextPage !== true || typeof pageInfo.endCursor !== "string") {
-      return { kind: "ok", nodes };
+
+    const pageNodes = Array.isArray(orders.nodes) ? orders.nodes : [];
+    for (const node of pageNodes) {
+      nodes.push(node);
+      const updatedAt = isRecord(node) && typeof node.updatedAt === "string" ? node.updatedAt : "";
+      const updatedAtMs = Date.parse(updatedAt);
+      if (!Number.isNaN(updatedAtMs) && updatedAtMs > maxUpdatedAtMs) {
+        maxUpdatedAtMs = updatedAtMs;
+        maxUpdatedAt = updatedAt;
+      }
+    }
+
+    const pageInfo = isRecord(orders.pageInfo) ? orders.pageInfo : undefined;
+    if (pageInfo?.hasNextPage !== true) {
+      return ok(false);
+    }
+    if (typeof pageInfo.endCursor !== "string") {
+      // More pages exist but no cursor to reach them: report truncation so
+      // the caller anchors the next window at the watermark.
+      return ok(true);
     }
     cursor = pageInfo.endCursor;
   }
 
-  // Page cap reached: return what was gathered; the next sync tick resumes
-  // from the new lastSyncAt window.
-  return { kind: "ok", nodes };
+  // Page cap reached with more pages remaining: truncated plus the updatedAt
+  // watermark lets the caller continue from here on the next tick (the query
+  // sorts ascending by UPDATED_AT, so nothing before the watermark was missed).
+  return ok(true);
 }

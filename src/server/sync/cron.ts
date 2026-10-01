@@ -17,7 +17,8 @@ export async function runAllSyncs(db: Db, env: CloudflareEnv, opts?: SyncOptions
     // One workspace blowing up must not take down the rest of the tick.
     try {
       const result = await runSync(db, env, workspaceId, opts);
-      // Phase 5/6 hook point: broadcast/notify from result.addedOrderIds here.
+      // Phase 5/6 hook point: broadcast/notify from result.addedOrderIds and
+      // result.updatedOrderIds here.
       console.log(
         "[sync] " +
           JSON.stringify({

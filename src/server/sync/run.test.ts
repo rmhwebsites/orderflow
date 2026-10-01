@@ -9,7 +9,7 @@ import type { Db } from "../../db";
 import * as schema from "../../db/schema";
 import { encryptSecret } from "../crypto";
 import fixture from "../shopify/__fixtures__/orders-graphql.json";
-import { runSync } from "./run";
+import { runSync, applyPair } from "./run";
 import { runAllSyncs } from "./cron";
 
 // runSync against a real migrated SQLite database. @cloudflare/vitest-pool-workers
@@ -25,6 +25,7 @@ const WS = "ws_impact";
 const NOW = Date.parse("2026-10-01T12:00:00.000Z");
 const LATER = NOW + 600000;
 const SIXTY_DAYS_MS = 60 * 24 * 60 * 60 * 1000;
+const OVERLAP_MS = 300000;
 
 const TOKEN_UNREADABLE = "Token unreadable, re-enter it in Settings";
 const TOKEN_REJECTED = "Shopify rejected the token. Update the connection in Settings.";
@@ -113,28 +114,42 @@ async function seedWorkspace(
   }
 }
 
-async function makeDb(opts?: Parameters<typeof seedWorkspace>[2] & { seed?: boolean }) {
+async function makeDb(opts?: Parameters<typeof seedWorkspace>[2]) {
   const ctx = openDb();
-  if (opts?.seed !== false) {
-    await seedWorkspace(ctx.db, WS, opts);
-  }
+  await seedWorkspace(ctx.db, WS, opts);
   return ctx;
 }
 
-type RecordedCall = { url: string; body: { query?: string } };
+type RecordedCall = {
+  url: string;
+  body: { query?: string; variables?: { cursor?: unknown; search?: unknown } };
+};
 
-function pageFetch(nodes: unknown[]) {
+type ScriptedPage = { nodes: unknown[]; hasNextPage: boolean; endCursor?: string | null };
+
+// Returns one scripted page per call; the last page repeats if calls overrun.
+function scriptedFetch(script: ScriptedPage[]) {
   const calls: RecordedCall[] = [];
   const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     calls.push({ url: String(input), body: JSON.parse(String(init?.body ?? "{}")) });
+    const page = script[Math.min(calls.length - 1, script.length - 1)];
     return new Response(
       JSON.stringify({
-        data: { orders: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } },
+        data: {
+          orders: {
+            nodes: page.nodes,
+            pageInfo: { hasNextPage: page.hasNextPage, endCursor: page.endCursor ?? null },
+          },
+        },
       }),
       { status: 200 },
     );
   }) as typeof fetch;
   return { impl, calls };
+}
+
+function pageFetch(nodes: unknown[]) {
+  return scriptedFetch([{ nodes, hasNextPage: false }]);
 }
 
 function statusFetch(status: number) {
@@ -147,8 +162,70 @@ function statusFetch(status: number) {
 }
 
 function errorsFetch(errors: unknown[]) {
-  const impl = (async () => new Response(JSON.stringify({ errors }), { status: 200 })) as typeof fetch;
+  const impl = (async () =>
+    new Response(JSON.stringify({ errors }), { status: 200 })) as typeof fetch;
   return { impl };
+}
+
+// Proxy that adds a D1-style batch to the better-sqlite3 Db so the batch
+// branch of applyPair runs in-flow.
+function withBatch(db: Db, record: unknown[][]): Db {
+  const batch = async (statements: PromiseLike<unknown>[]) => {
+    record.push([...statements]);
+    const out: unknown[] = [];
+    for (const statement of statements) {
+      out.push(await statement);
+    }
+    return out;
+  };
+  return new Proxy(db as object, {
+    get(target, prop) {
+      if (prop === "batch") {
+        return batch;
+      }
+      const value = Reflect.get(target, prop);
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  }) as unknown as Db;
+}
+
+// Proxy that rewraps every update result into the D1 shape ({meta: {changes}}),
+// to prove the lease CAS reads rows-affected from both driver shapes.
+function d1Wrap(builder: unknown): unknown {
+  return new Proxy(builder as object, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop);
+      if (prop === "then") {
+        return (onFulfilled?: (v: unknown) => unknown, onRejected?: (e: unknown) => unknown) =>
+          (target as PromiseLike<{ changes?: number }>).then(
+            (res) => onFulfilled?.({ success: true, meta: { changes: res?.changes } }),
+            onRejected,
+          );
+      }
+      if (typeof value === "function") {
+        return (...args: unknown[]) =>
+          d1Wrap((value as (...a: unknown[]) => unknown).apply(target, args));
+      }
+      return value;
+    },
+  });
+}
+
+function withD1UpdateResults(db: Db): Db {
+  return new Proxy(db as object, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop);
+      if (prop === "update" && typeof value === "function") {
+        return (...args: unknown[]) =>
+          d1Wrap((value as (...a: unknown[]) => unknown).apply(target, args));
+      }
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  }) as unknown as Db;
 }
 
 function ordersIn(db: Db, wsId: string) {
@@ -178,6 +255,7 @@ describe("runSync", () => {
     const result = await runSync(db, env, WS, { fetchImpl: first.impl, now: () => NOW });
     expect(result.added).toBe(3);
     expect(result.updated).toBe(0);
+    expect(result.updatedOrderIds).toEqual([]);
     expect(result.skipped).toBeUndefined();
     expect(result.error).toBeUndefined();
 
@@ -234,6 +312,7 @@ describe("runSync", () => {
 
     const rows = await ordersIn(db, WS);
     expect(rows).toHaveLength(1);
+    expect(result.updatedOrderIds).toEqual([rows[0].id]);
     expect(rows[0].statusKey).toBe("in_progress");
     expect(rows[0].statusSetBy).toBe("user_marta");
     expect(rows[0].statusSetAt).toBe(777);
@@ -241,6 +320,49 @@ describe("runSync", () => {
     expect(rows[0].syncedAt).toBe(LATER);
     expect(rows[0].name).toBe("#1101");
     expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
+  });
+
+  it("gives the order_new event a deterministic id derived from the order id", async () => {
+    const { db, env } = await makeDb();
+    await runSync(db, env, WS, { fetchImpl: pageFetch([rileyNode]).impl, now: () => NOW });
+    const [order] = await ordersIn(db, WS);
+    const [event] = await eventsIn(db, WS, "order_new");
+    expect(event.id).toBe(`evt-order-new-${order.id}`);
+  });
+
+  it("handles the same order twice in one batch: one row, one event, no throw", async () => {
+    const { db, env } = await makeDb();
+    const result = await runSync(db, env, WS, {
+      fetchImpl: pageFetch([rileyNode, { ...rileyNode }]).impl,
+      now: () => NOW,
+    });
+    expect(result.added).toBe(1);
+    expect(result.updated).toBe(0);
+    expect(result.error).toBeUndefined();
+    expect(await ordersIn(db, WS)).toHaveLength(1);
+    expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
+  });
+
+  it("clears the lease and records lastError when the write loop throws", async () => {
+    const { db, raw, env } = openDb();
+    await seedWorkspace(db, WS);
+    // Remove the workspace row behind the foreign key's back so the order
+    // insert throws mid-loop.
+    raw.pragma("foreign_keys = OFF");
+    raw.prepare("DELETE FROM workspaces WHERE id = ?").run(WS);
+    raw.pragma("foreign_keys = ON");
+
+    const result = await runSync(db, env, WS, {
+      fetchImpl: pageFetch([rileyNode]).impl,
+      now: () => NOW,
+    });
+    expect(result.error).toBeTruthy();
+    expect(result.added).toBe(0);
+
+    const connection = await connectionOf(db, WS);
+    expect(connection.runningUntil).toBe(0);
+    expect(connection.lastError).toContain("FOREIGN KEY");
+    expect(connection.lastSyncAt).toBe(0);
   });
 
   it("skips while another run holds the lease", async () => {
@@ -255,6 +377,24 @@ describe("runSync", () => {
     expect(result.skipped).toBe("running");
     expect(result.added).toBe(0);
     expect(calls).toHaveLength(0);
+  });
+
+  it("reads the lease CAS rows-affected from the D1 result shape too", async () => {
+    const { db, env } = await makeDb();
+    const d1ish = withD1UpdateResults(db);
+
+    const free = pageFetch([rileyNode]);
+    const first = await runSync(d1ish, env, WS, { fetchImpl: free.impl, now: () => NOW });
+    expect(first.added).toBe(1);
+
+    await db
+      .update(schema.storeConnections)
+      .set({ runningUntil: LATER + 60000 })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+    const blocked = pageFetch([rileyNode]);
+    const second = await runSync(d1ish, env, WS, { fetchImpl: blocked.impl, now: () => LATER });
+    expect(second.skipped).toBe("running");
+    expect(blocked.calls).toHaveLength(0);
   });
 
   it("skips when the workspace has no connection", async () => {
@@ -307,6 +447,25 @@ describe("runSync", () => {
     expect(await eventsIn(db, WS, "sync_error")).toHaveLength(0);
   });
 
+  it("treats an unexpected 2xx response shape as transient and keeps lastSyncAt", async () => {
+    const { db, env } = await makeDb();
+    const previousSync = NOW - 3600000;
+    await db
+      .update(schema.storeConnections)
+      .set({ lastSyncAt: previousSync })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    // statusFetch(200) returns a bare {} body: no data.orders object.
+    const { impl } = statusFetch(200);
+    const result = await runSync(db, env, WS, { fetchImpl: impl, now: () => NOW });
+    expect(result.error).toBe("unexpected response shape");
+
+    const connection = await connectionOf(db, WS);
+    expect(connection.status).toBe("ok");
+    expect(connection.lastSyncAt).toBe(previousSync);
+    expect(connection.runningUntil).toBe(0);
+  });
+
   it("writes a sync_error event on fatal failure, truncated to 300 chars", async () => {
     const { db, env } = await makeDb();
     const longMessage = "Z".repeat(400);
@@ -319,8 +478,28 @@ describe("runSync", () => {
     expect(syncErrors[0].text).toBe("Z".repeat(300));
     expect(syncErrors[0].orderId).toBeNull();
     const connection = await connectionOf(db, WS);
+    expect(connection.lastError).toBe("Z".repeat(300));
     expect(connection.lastSyncAt).toBe(0);
     expect(connection.runningUntil).toBe(0);
+  });
+
+  it("writes a sync_error event only when the fatal detail changes", async () => {
+    const { db, env } = await makeDb();
+    await runSync(db, env, WS, {
+      fetchImpl: errorsFetch([{ message: "schema mismatch" }]).impl,
+      now: () => NOW,
+    });
+    await runSync(db, env, WS, {
+      fetchImpl: errorsFetch([{ message: "schema mismatch" }]).impl,
+      now: () => NOW + 1000,
+    });
+    expect(await eventsIn(db, WS, "sync_error")).toHaveLength(1);
+
+    await runSync(db, env, WS, {
+      fetchImpl: errorsFetch([{ message: "different failure" }]).impl,
+      now: () => NOW + 2000,
+    });
+    expect(await eventsIn(db, WS, "sync_error")).toHaveLength(2);
   });
 
   it("marks the connection when the token cannot be decrypted", async () => {
@@ -344,12 +523,49 @@ describe("runSync", () => {
     const first = pageFetch([]);
     await runSync(db, env, WS, { fetchImpl: first.impl, now: () => NOW });
     const firstWindow = new Date(NOW - SIXTY_DAYS_MS).toISOString();
-    expect(first.calls[0].body.query).toContain(`updated_at:>='${firstWindow}'`);
+    expect(first.calls[0].body.variables?.search).toBe(`updated_at:>='${firstWindow}'`);
 
     const second = pageFetch([]);
     await runSync(db, env, WS, { fetchImpl: second.impl, now: () => LATER });
-    const overlapWindow = new Date(NOW - 300000).toISOString();
-    expect(second.calls[0].body.query).toContain(`updated_at:>='${overlapWindow}'`);
+    const overlapWindow = new Date(NOW - OVERLAP_MS).toISOString();
+    expect(second.calls[0].body.variables?.search).toBe(`updated_at:>='${overlapWindow}'`);
+  });
+
+  it("resumes from the updatedAt watermark after a capped run", async () => {
+    const { db, env } = await makeDb();
+    const base = Date.parse("2026-09-25T00:00:00.000Z");
+    const nodeAt = (i: number) => ({
+      id: `gid://shopify/Order/${7000 + i}`,
+      legacyResourceId: String(7000 + i),
+      name: `#2${String(i).padStart(3, "0")}`,
+      createdAt: new Date(base + i * 60000).toISOString(),
+      updatedAt: new Date(base + i * 60000).toISOString(),
+      tags: [],
+      lineItems: { nodes: [] },
+    });
+
+    // 11 pages of data exist; the client gathers 10 and reports truncation.
+    const first = scriptedFetch(
+      Array.from({ length: 10 }, (_, i) => ({
+        nodes: [nodeAt(i)],
+        hasNextPage: true,
+        endCursor: `c${i}`,
+      })),
+    );
+    const r1 = await runSync(db, env, WS, { fetchImpl: first.impl, now: () => NOW });
+    expect(r1.added).toBe(10);
+    const watermark = nodeAt(9).updatedAt;
+    expect((await connectionOf(db, WS)).lastSyncAt).toBe(Date.parse(watermark));
+
+    // The next window anchors at the watermark (minus the safety overlap),
+    // not at the wall clock, so the capped remainder is fetched.
+    const second = scriptedFetch([{ nodes: [nodeAt(10)], hasNextPage: false }]);
+    const r2 = await runSync(db, env, WS, { fetchImpl: second.impl, now: () => LATER });
+    const expectedSince = new Date(Date.parse(watermark) - OVERLAP_MS).toISOString();
+    expect(second.calls[0].body.variables?.search).toBe(`updated_at:>='${expectedSince}'`);
+    expect(r2.added).toBe(1);
+    expect(await ordersIn(db, WS)).toHaveLength(11);
+    expect((await connectionOf(db, WS)).lastSyncAt).toBe(LATER);
   });
 
   it("falls back to status key new when the workspace has no statuses", async () => {
@@ -358,6 +574,69 @@ describe("runSync", () => {
     const rows = await ordersIn(db, WS);
     expect(rows).toHaveLength(1);
     expect(rows[0].statusKey).toBe("new");
+  });
+
+  it("handles batches larger than one existence-query chunk", async () => {
+    const { db, env } = await makeDb();
+    const nodes = Array.from({ length: 120 }, (_, i) => ({
+      id: `gid://shopify/Order/${8000 + i}`,
+      legacyResourceId: String(8000 + i),
+      name: `#8${String(i).padStart(3, "0")}`,
+      tags: [],
+      lineItems: { nodes: [] },
+    }));
+
+    const r1 = await runSync(db, env, WS, { fetchImpl: pageFetch(nodes).impl, now: () => NOW });
+    expect(r1.added).toBe(120);
+    const r2 = await runSync(db, env, WS, { fetchImpl: pageFetch(nodes).impl, now: () => LATER });
+    expect(r2.added).toBe(0);
+    expect(r2.updated).toBe(0);
+    expect(await ordersIn(db, WS)).toHaveLength(120);
+    expect(await eventsIn(db, WS, "order_new")).toHaveLength(120);
+  });
+
+  it("runs the insert pair through a shimmed db.batch in-flow", async () => {
+    const { db, env } = await makeDb();
+    const batched: unknown[][] = [];
+    const result = await runSync(withBatch(db, batched), env, WS, {
+      fetchImpl: pageFetch([rileyNode]).impl,
+      now: () => NOW,
+    });
+    expect(result.added).toBe(1);
+    expect(batched).toHaveLength(1);
+    expect(batched[0]).toHaveLength(2);
+    expect(await ordersIn(db, WS)).toHaveLength(1);
+    expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
+  });
+});
+
+describe("applyPair", () => {
+  it("routes both statements through db.batch without awaiting them individually", async () => {
+    const batch = vi.fn(async () => []);
+    const a = { then: vi.fn() };
+    const b = { then: vi.fn() };
+    await applyPair(
+      { batch } as unknown as Db,
+      a as unknown as PromiseLike<unknown>,
+      b as unknown as PromiseLike<unknown>,
+    );
+    expect(batch).toHaveBeenCalledTimes(1);
+    expect(batch).toHaveBeenCalledWith([a, b]);
+    expect(a.then).not.toHaveBeenCalled();
+    expect(b.then).not.toHaveBeenCalled();
+  });
+
+  it("awaits the statements in order when batch is unavailable", async () => {
+    const executed: string[] = [];
+    const statement = (name: string) =>
+      ({
+        then: (resolve: (value: unknown) => void) => {
+          executed.push(name);
+          resolve(undefined);
+        },
+      }) as PromiseLike<unknown>;
+    await applyPair({} as Db, statement("order"), statement("event"));
+    expect(executed).toEqual(["order", "event"]);
   });
 });
 
@@ -369,7 +648,7 @@ describe("runAllSyncs", () => {
     await seedWorkspace(db, "ws_c", { connectionStatus: "disabled" });
 
     // Break ws_a behind the foreign key's back: deleting its workspace row
-    // makes the order insert inside runSync throw, which must not stop ws_b.
+    // makes the order insert inside runSync fail, which must not stop ws_b.
     raw.pragma("foreign_keys = OFF");
     raw.prepare("DELETE FROM workspaces WHERE id = 'ws_a'").run();
     raw.pragma("foreign_keys = ON");

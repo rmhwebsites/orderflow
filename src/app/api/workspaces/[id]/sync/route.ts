@@ -10,7 +10,8 @@ type RouteContext = { params: Promise<{ id: string }> };
 // A manual sync may run at most once per 30 seconds per workspace.
 const MANUAL_SYNC_COOLDOWN_MS = 30000;
 
-// Connection card data: null when the workspace has no store connection.
+// Connection card data as { connection: {...} | null }; Phase 5 builds
+// against this shape.
 export async function GET(_request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
@@ -22,13 +23,15 @@ export async function GET(_request: Request, context: RouteContext) {
       .limit(1);
     const connection = rows[0];
     if (!connection) {
-      return NextResponse.json(null);
+      return NextResponse.json({ connection: null });
     }
     return NextResponse.json({
-      lastSyncAt: connection.lastSyncAt,
-      status: connection.status,
-      lastError: connection.lastError,
-      shopDomain: connection.shopDomain,
+      connection: {
+        lastSyncAt: connection.lastSyncAt,
+        status: connection.status,
+        lastError: connection.lastError,
+        shopDomain: connection.shopDomain,
+      },
     });
   } catch (e) {
     return guardResponse(e);
@@ -48,21 +51,27 @@ export async function POST(_request: Request, context: RouteContext) {
       .limit(1);
     const connection = rows[0];
     if (connection && connection.lastManualSyncAt > now - MANUAL_SYNC_COOLDOWN_MS) {
+      const retryAfterSeconds = Math.ceil(
+        (connection.lastManualSyncAt + MANUAL_SYNC_COOLDOWN_MS - now) / 1000,
+      );
       return NextResponse.json(
         { error: "Sync already ran in the last 30 seconds" },
-        { status: 429 },
+        { status: 429, headers: { "Retry-After": String(retryAfterSeconds) } },
       );
     }
-    if (connection) {
+
+    const { env } = getCloudflareContext();
+    const result = await runSync(db, env, id);
+    // The cooldown only counts runs that actually happened: a skipped run
+    // (lease held, no connection, disabled) can be retried immediately.
+    if (connection && !result.skipped) {
       await db
         .update(storeConnections)
         .set({ lastManualSyncAt: now })
         .where(eq(storeConnections.workspaceId, id));
     }
-
-    const { env } = getCloudflareContext();
-    const result = await runSync(db, env, id);
-    // Phase 5/6 hook point: broadcast/notify from result.addedOrderIds here.
+    // Phase 5/6 hook point: broadcast/notify from result.addedOrderIds and
+    // result.updatedOrderIds here.
 
     if (result.error) {
       // 502 so the connection card can surface the failure text.

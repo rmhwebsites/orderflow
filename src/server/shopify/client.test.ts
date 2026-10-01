@@ -4,6 +4,7 @@ import { fetchOrdersUpdatedSince, SHOPIFY_API_VERSION } from "./client";
 const DOMAIN = "impact-rentals.myshopify.com";
 const TOKEN = "shpat_super_secret_value_9f3a";
 const SINCE = "2026-08-01T00:00:00.000Z";
+const SEARCH = `updated_at:>='${SINCE}'`;
 
 type RecordedCall = { url: string; init: RequestInit; body: Record<string, unknown> };
 
@@ -40,14 +41,25 @@ function stubFetch(script: Array<Response | Error | (() => Response)>) {
   return { impl, calls };
 }
 
+function variablesOf(call: RecordedCall): Record<string, unknown> {
+  return call.body.variables as Record<string, unknown>;
+}
+
 describe("fetchOrdersUpdatedSince", () => {
   it("fetches a single page of orders", async () => {
-    const nodes = [{ id: "gid://shopify/Order/1", name: "#1001" }];
+    const nodes = [
+      { id: "gid://shopify/Order/1", name: "#1001", updatedAt: "2026-09-14T09:15:40Z" },
+    ];
     const { impl, calls } = stubFetch([ordersPage(nodes, { hasNextPage: false, endCursor: null })]);
 
     const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
 
-    expect(result).toEqual({ kind: "ok", nodes });
+    expect(result).toEqual({
+      kind: "ok",
+      nodes,
+      truncated: false,
+      maxUpdatedAt: "2026-09-14T09:15:40Z",
+    });
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe(`https://${DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`);
     expect(calls[0].init.method).toBe("POST");
@@ -57,15 +69,16 @@ describe("fetchOrdersUpdatedSince", () => {
     const query = String(calls[0].body.query);
     expect(query).toContain("first: 50");
     expect(query).toContain("sortKey: UPDATED_AT");
-    expect(query).toContain(`updated_at:>='${SINCE}'`);
+    expect(query).toContain("query: $search");
     expect(query).toContain("legacyResourceId");
     expect(query).toContain("lineItems(first: 50)");
-    expect((calls[0].body.variables as Record<string, unknown>).cursor).toBeNull();
+    expect(variablesOf(calls[0]).cursor).toBeNull();
+    expect(variablesOf(calls[0]).search).toBe(SEARCH);
   });
 
-  it("paginates and passes the cursor on the second call", async () => {
-    const first = [{ id: "gid://shopify/Order/1" }];
-    const second = [{ id: "gid://shopify/Order/2" }];
+  it("paginates, passes the cursor on the second call, and tracks the max updatedAt", async () => {
+    const first = [{ id: "gid://shopify/Order/1", updatedAt: "2026-09-10T00:00:00Z" }];
+    const second = [{ id: "gid://shopify/Order/2", updatedAt: "2026-09-11T00:00:00Z" }];
     const { impl, calls } = stubFetch([
       ordersPage(first, { hasNextPage: true, endCursor: "cursor-page-2" }),
       ordersPage(second, { hasNextPage: false, endCursor: null }),
@@ -73,18 +86,25 @@ describe("fetchOrdersUpdatedSince", () => {
 
     const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
 
-    expect(result).toEqual({ kind: "ok", nodes: [...first, ...second] });
+    expect(result).toEqual({
+      kind: "ok",
+      nodes: [...first, ...second],
+      truncated: false,
+      maxUpdatedAt: "2026-09-11T00:00:00Z",
+    });
     expect(calls).toHaveLength(2);
-    expect((calls[0].body.variables as Record<string, unknown>).cursor).toBeNull();
-    expect((calls[1].body.variables as Record<string, unknown>).cursor).toBe("cursor-page-2");
+    expect(variablesOf(calls[0]).cursor).toBeNull();
+    expect(variablesOf(calls[1]).cursor).toBe("cursor-page-2");
+    expect(variablesOf(calls[1]).search).toBe(SEARCH);
   });
 
-  it("stops at the hard cap of 10 pages and returns what was gathered", async () => {
+  it("reports truncation and the updatedAt watermark at the 10 page cap", async () => {
+    const base = Date.parse("2026-09-01T00:00:00.000Z");
     const script = Array.from({ length: 12 }, (_, i) =>
-      ordersPage([{ id: `gid://shopify/Order/${i}` }], {
-        hasNextPage: true,
-        endCursor: `cursor-${i}`,
-      }),
+      ordersPage(
+        [{ id: `gid://shopify/Order/${i}`, updatedAt: new Date(base + i * 60000).toISOString() }],
+        { hasNextPage: true, endCursor: `cursor-${i}` },
+      ),
     );
     const { impl, calls } = stubFetch(script);
 
@@ -94,7 +114,16 @@ describe("fetchOrdersUpdatedSince", () => {
     expect(result.kind).toBe("ok");
     if (result.kind === "ok") {
       expect(result.nodes).toHaveLength(10);
+      expect(result.truncated).toBe(true);
+      expect(result.maxUpdatedAt).toBe(new Date(base + 9 * 60000).toISOString());
     }
+  });
+
+  it("returns a null watermark when no node carries a usable updatedAt", async () => {
+    const nodes = [{ id: "gid://shopify/Order/1" }, { id: "gid://shopify/Order/2", updatedAt: 7 }];
+    const { impl } = stubFetch([ordersPage(nodes, { hasNextPage: false, endCursor: null })]);
+    const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
+    expect(result).toEqual({ kind: "ok", nodes, truncated: false, maxUpdatedAt: null });
   });
 
   it("classifies 401 and 403 as auth", async () => {
@@ -116,7 +145,26 @@ describe("fetchOrdersUpdatedSince", () => {
     }
   });
 
-  it("classifies a THROTTLED GraphQL error as transient", async () => {
+  it("classifies any other non-2xx status as transient instead of parsing it", async () => {
+    for (const status of [302, 400, 404]) {
+      const { impl } = stubFetch([jsonResponse({ data: { orders: { nodes: [] } } }, status)]);
+      const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
+      expect(result.kind).toBe("transient");
+      if (result.kind === "transient") {
+        expect(result.detail).toContain(String(status));
+      }
+    }
+  });
+
+  it("classifies a 2xx body without a data.orders object as transient", async () => {
+    for (const body of [{}, { data: {} }, { data: { orders: "nope" } }]) {
+      const { impl } = stubFetch([jsonResponse(body)]);
+      const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
+      expect(result).toEqual({ kind: "transient", detail: "unexpected response shape" });
+    }
+  });
+
+  it("classifies a THROTTLED GraphQL error as transient via extensions.code", async () => {
     const { impl } = stubFetch([
       jsonResponse({
         errors: [{ message: "Throttled", extensions: { code: "THROTTLED" } }],
@@ -124,6 +172,14 @@ describe("fetchOrdersUpdatedSince", () => {
     ]);
     const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
     expect(result.kind).toBe("transient");
+  });
+
+  it("does not treat THROTTLED inside a message as throttling", async () => {
+    const { impl } = stubFetch([
+      jsonResponse({ errors: [{ message: "field THROTTLED does not exist" }] }),
+    ]);
+    const result = await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
+    expect(result).toEqual({ kind: "fatal", detail: "field THROTTLED does not exist" });
   });
 
   it("classifies other GraphQL errors as fatal with the first message", async () => {
