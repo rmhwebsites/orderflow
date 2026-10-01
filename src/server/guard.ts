@@ -23,23 +23,29 @@ export class AuthError extends Error {
   }
 }
 
+// Session guard for routes that are not workspace-scoped (listing and
+// creating workspaces). 401 without a session.
+export async function requireSession() {
+  const session = await getAuth().api.getSession({ headers: await headers() });
+  if (!session) {
+    throw new AuthError(401, "Not signed in");
+  }
+  return { userId: session.user.id, db: getDb(), session };
+}
+
 // Membership guard for workspace-scoped routes. 401 without a session; 404
 // both when the workspace has no membership for the user and when the role is
 // under-ranked, so a non-member cannot distinguish "exists but forbidden"
 // from "does not exist".
 export async function requireMember(workspaceId: string, required: Role) {
-  const session = await getAuth().api.getSession({ headers: await headers() });
-  if (!session) {
-    throw new AuthError(401, "Not signed in");
-  }
-  const db = getDb();
+  const { userId, db, session } = await requireSession();
   const rows = await db
     .select()
     .from(workspaceMembers)
     .where(
       and(
         eq(workspaceMembers.workspaceId, workspaceId),
-        eq(workspaceMembers.userId, session.user.id),
+        eq(workspaceMembers.userId, userId),
       ),
     )
     .limit(1);
@@ -47,7 +53,7 @@ export async function requireMember(workspaceId: string, required: Role) {
   if (!membership || !roleAtLeast(membership.role, required)) {
     throw new AuthError(404, "Not found");
   }
-  return { userId: session.user.id, role: membership.role, db, session };
+  return { userId, role: membership.role, db, session };
 }
 
 export function guardResponse(e: unknown): NextResponse {
