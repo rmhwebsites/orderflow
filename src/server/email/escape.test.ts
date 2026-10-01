@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { escapeHtml } from "./escape";
+import { escapeHtml, sanitizeSubject } from "./escape";
 
 describe("escapeHtml", () => {
   it("escapes ampersands", () => {
@@ -24,5 +24,19 @@ describe("escapeHtml", () => {
 
   it("passes plain text through unchanged", () => {
     expect(escapeHtml("Impact Rentals 2026")).toBe("Impact Rentals 2026");
+  });
+});
+
+describe("sanitizeSubject", () => {
+  it("leaves HTML-significant characters alone", () => {
+    expect(sanitizeSubject("Bob & Co")).toBe("Bob & Co");
+  });
+
+  it("strips CRLF", () => {
+    expect(sanitizeSubject("a\r\nb")).toBe("a b");
+  });
+
+  it("strips control characters and collapses whitespace", () => {
+    expect(sanitizeSubject("  x\u0000y  ")).toBe("x y");
   });
 });

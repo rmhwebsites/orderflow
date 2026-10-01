@@ -25,10 +25,13 @@ function firstUrlIn(html: string): string | undefined {
  * Sends an email through Resend.
  *
  * Convention for ALL templates (current and Phase 6/7, which interpolate
- * customer and vendor data): every dynamic value interpolated into
- * `opts.html` or `opts.subject` MUST be passed through escapeHtml from
- * "./escape" at the call site. sendEmail does not escape for you, because it
- * cannot tell markup from data.
+ * customer and vendor data), applied at the call site because sendEmail
+ * cannot tell markup from data:
+ * - every dynamic value interpolated into `opts.html` MUST pass through
+ *   escapeHtml from "./escape";
+ * - every dynamic value interpolated into `opts.subject` MUST pass through
+ *   sanitizeSubject from "./escape", never escapeHtml (subjects are plain
+ *   text, so entity encoding would show literally).
  *
  * Dev fallback: only when APP_URL points at localhost AND the Resend key is
  * missing or the placeholder, the email is logged instead of sent. Outside

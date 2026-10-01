@@ -12,3 +12,13 @@ const ENTITIES: Record<string, string> = {
 export function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => ENTITIES[char]);
 }
+
+// Subjects are plain text, never HTML: no entity encoding. Strips CR/LF and
+// other control characters (header-injection hygiene), collapses whitespace,
+// trims.
+export function sanitizeSubject(value: string): string {
+  return value
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}

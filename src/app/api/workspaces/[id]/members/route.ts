@@ -2,7 +2,7 @@ import { and, eq } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { pendingInvites, user, workspaceMembers, workspaces } from "@/db/schema";
-import { escapeHtml } from "@/server/email/escape";
+import { escapeHtml, sanitizeSubject } from "@/server/email/escape";
 import { sendEmail } from "@/server/email/resend";
 import { EMAIL_FROM } from "@/server/email/magic-link";
 import { AuthError, guardResponse, requireMember, roleAtLeast } from "@/server/guard";
@@ -106,14 +106,14 @@ export async function POST(request: Request, context: RouteContext) {
         });
     }
 
-    // Workspace names are user input: escaped in both the subject and the
-    // HTML (see the sendEmail JSDoc convention).
+    // Workspace names are user input: entity-escaped in the HTML body,
+    // control-stripped (plain text) in the subject. See the sendEmail JSDoc.
     const safeName = escapeHtml(workspaceName);
     const { env } = getCloudflareContext();
     await sendEmail(env, {
       from: EMAIL_FROM,
       to: [email],
-      subject: `You have been added to ${safeName} on Order Desk`,
+      subject: `You have been added to ${sanitizeSubject(workspaceName)} on Order Desk`,
       html: [
         '<div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 24px;">',
         `<h1 style="font-size: 20px; color: #101820;">You have been added to ${safeName}</h1>`,
