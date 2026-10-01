@@ -573,3 +573,4 @@ Commit `docs: operations README`.
 - After each phase, re-run the full test suite and do a quick phone-width visual pass on changed screens, light and dark.
 - The two externally risky integrations are flagged inside their tasks: the OpenNext custom entrypoint mechanism (Task 0.3, pin to installed version docs) and better-auth's generated schema (Task 2.1, reconcile with CLI output).
 - Shopify API version: pin `2025-07`; bump deliberately.
+- esbuild is a direct devDependency on purpose: opennextjs-cloudflare imports it undeclared and vite 8 lists it as an optional peer; do not prune it.

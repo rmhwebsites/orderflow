@@ -4,19 +4,16 @@ import "./globals.css";
 
 const sora = Sora({
   subsets: ["latin"],
-  weight: ["600", "700", "800"],
   variable: "--font-sora",
 });
 
 const redHatDisplay = Red_Hat_Display({
   subsets: ["latin"],
-  weight: ["400", "500", "600", "700"],
   variable: "--font-red-hat-display",
 });
 
 const redHatMono = Red_Hat_Mono({
   subsets: ["latin"],
-  weight: ["400", "500", "700"],
   variable: "--font-red-hat-mono",
 });
 
@@ -32,7 +29,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body
-        className={`${sora.variable} ${redHatDisplay.variable} ${redHatMono.variable}`}
+        className={`${sora.variable} ${redHatDisplay.variable} ${redHatMono.variable} font-sans`}
       >
         {children}
       </body>

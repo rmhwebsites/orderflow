@@ -3,7 +3,9 @@
   "name": "order-desk",
   "main": "custom-worker.ts",
   "compatibility_date": "2026-09-01",
-  "compatibility_flags": ["nodejs_compat"],
+  // global_fetch_strictly_public: lets the Worker fetch its own public hostname
+  // (needed for auth flows that call back into the app's own URL)
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "assets": { "directory": ".open-next/assets", "binding": "ASSETS" },
   "d1_databases": [
     {
@@ -20,5 +22,8 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceRoom"] }],
   "triggers": { "crons": ["*/10 * * * *"] },
-  "vars": { "APP_URL": "http://localhost:3000" }
+  "observability": { "enabled": true },
+  // TODO: replace APP_URL with the real deployed URL after the first `wrangler deploy`;
+  // local development reads APP_URL from .dev.vars instead
+  "vars": { "APP_URL": "https://REPLACE_ME_AFTER_DEPLOY.workers.dev" }
 }

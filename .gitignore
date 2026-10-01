@@ -11,8 +11,10 @@ node_modules
 .wrangler
 
 # local secrets
-.dev.vars
-*.env*
+.env
+.env.*
+.dev.vars*
+!.dev.vars.example
 
 # os
 .DS_Store
