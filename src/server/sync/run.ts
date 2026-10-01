@@ -14,12 +14,15 @@ export type SyncResult = {
   updated: number;
   // Order row ids inserted / snapshot-updated this run. Phase 5/6 call sites
   // broadcast to the workspace room and fan out notifications from these.
+  // Both lists are rows-affected truth: an id appears only when this run's
+  // own write changed exactly one row, also on a superseded or failed run.
   addedOrderIds: string[];
   updatedOrderIds: string[];
   skipped?: "running" | "no-connection" | "disabled";
   error?: string;
   // True when another run took over the lease mid-flight; this run wrote no
   // terminal connection state and its lastError/status must not be trusted.
+  // added / updated still list exactly the order rows this run landed.
   superseded?: boolean;
 };
 
@@ -94,8 +97,27 @@ export async function applyPair(
 type ConnectionWrite = Partial<typeof storeConnections.$inferInsert>;
 
 // Terminal connection writes are fenced on the exact lease value this run
-// set: if another run has re-leased the row since, zero rows match and this
-// stale run must not touch anything else either.
+// set: if another run has re-leased (or released) the row since, zero rows
+// match, nothing is written, and the caller reports superseded.
+//
+// What the fence protects: the store_connections row only (status, lastError,
+// lastSyncAt, the sync cursor pair, and the lease release itself). A run that
+// outlived its lease can never overwrite a newer run's connection state or
+// free a lease it no longer owns.
+//
+// What the fence does NOT protect: writes to orders and events. Those happen
+// before the terminal write and are not lease-checked, so a superseded run's
+// rows can still land. They are made safe on their own terms instead:
+// - order + order_new event inserts are conflict no-ops with a deterministic
+//   event id, so a replay or a racing run inserts nothing twice;
+// - the snapshot UPDATE is monotonic on synced_at (it only matches rows whose
+//   synced_at is at or before this run's now), so a stale run cannot regress a
+//   snapshot written by a run that started later;
+// - added / updated counts and ids come from rows-affected, so a write that
+//   was a no-op or was guarded away is never reported.
+// The synced_at guard orders runs by start time, not by fetch time: a zombie's
+// snapshot is dropped even when it was fetched after the newer run's, and the
+// next window (lastSyncAt minus overlap) picks that change up again.
 async function fencedConnectionWrite(
   db: Db,
   workspaceId: string,
@@ -156,21 +178,23 @@ export async function runSync(
     return { ...empty(), skipped: "running" };
   }
 
-  // The pre-lease row may be stale by the time the lease is ours (another run
-  // may have finished in between); work from a fresh read.
-  const connRows = await db
-    .select()
-    .from(storeConnections)
-    .where(eq(storeConnections.workspaceId, workspaceId))
-    .limit(1);
-  const connection = connRows[0] ?? preLease;
-
   let added = 0;
   let updated = 0;
   const addedOrderIds: string[] = [];
   const updatedOrderIds: string[] = [];
 
+  // The lease is held from here on: everything that can throw stays inside
+  // this try so the catch path releases it through the fenced write.
   try {
+    // The pre-lease row may be stale by the time the lease is ours (another
+    // run may have finished in between); work from a fresh read.
+    const connRows = await db
+      .select()
+      .from(storeConnections)
+      .where(eq(storeConnections.workspaceId, workspaceId))
+      .limit(1);
+    const connection = connRows[0] ?? preLease;
+
     let token: string;
     try {
       token = await decryptSecret(connection.encryptedToken, env.ENCRYPTION_KEY, workspaceId);
@@ -335,18 +359,25 @@ export async function runSync(
         // Refresh the snapshot only. statusKey / statusSetBy / statusSetAt are
         // the team's own fields and a sync must never clobber them, and an
         // updated snapshot gets no new event (order_new is for new orders only).
-        await db
+        // Monotonic on synced_at: the orders table is outside the lease fence,
+        // so a run that outlived its lease may still get here. It must not
+        // regress a snapshot written by a run that started later, hence the
+        // synced_at <= now condition; rows-affected says whether it landed.
+        const snapshotResult = await db
           .update(orders)
           .set({ shopify: order, syncedAt: now })
-          .where(eq(orders.id, existing.id));
-        // An id added this run stays out of updatedOrderIds: a later duplicate
-        // in the same payload refines the new order, it does not "update" it.
-        if (!addedSet.has(existing.id) && !updatedSet.has(existing.id)) {
-          updated++;
-          updatedOrderIds.push(existing.id);
-          updatedSet.add(existing.id);
+          .where(and(eq(orders.id, existing.id), lte(orders.syncedAt, now)));
+        if (changesOf(snapshotResult) === 1) {
+          // An id added this run stays out of updatedOrderIds: a later
+          // duplicate in the same payload refines the new order, it does not
+          // "update" it.
+          if (!addedSet.has(existing.id) && !updatedSet.has(existing.id)) {
+            updated++;
+            updatedOrderIds.push(existing.id);
+            updatedSet.add(existing.id);
+          }
+          existingByShopifyId.set(order.shopifyOrderId, { id: existing.id, shopify: order });
         }
-        existingByShopifyId.set(order.shopifyOrderId, { id: existing.id, shopify: order });
       }
     }
 
@@ -365,18 +396,20 @@ export async function runSync(
     } else {
       // Window complete (or truncated with no cursor to resume from, where
       // the watermark is the only anchor). Anchoring rules:
-      // - completed cursor continuation: the max updatedAt seen (ascending
-      //   sort makes the final tick's max the max of the whole continuation),
-      //   falling back to the previous lastSyncAt, never now;
-      // - truncated without cursor: the watermark (client guarantees one);
-      // - plain completed window: now.
+      // - completed window, plain or resumed from a cursor: this run's now,
+      //   captured before the fetch began. The ascending cursor chain has
+      //   drained everything updated up to that moment, and anchoring a
+      //   finished continuation at its watermark instead would re-fetch a
+      //   dense burst sitting inside the overlap on every other tick forever;
+      // - truncated without cursor: the max updatedAt seen (the client
+      //   guarantees one), falling back to the previous lastSyncAt should it
+      //   ever be missing or unparseable, never now.
       const watermarkMs = fetched.maxUpdatedAt ? Date.parse(fetched.maxUpdatedAt) : NaN;
-      const anchor =
-        fetched.truncated || resuming
-          ? Number.isNaN(watermarkMs)
-            ? connection.lastSyncAt
-            : watermarkMs
-          : now;
+      const anchor = fetched.truncated
+        ? Number.isNaN(watermarkMs)
+          ? connection.lastSyncAt
+          : watermarkMs
+        : now;
       terminal = {
         lastSyncAt: anchor,
         syncCursor: null,
