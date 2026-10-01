@@ -1,9 +1,4 @@
-import { sendEmail } from "./resend";
-
-// Placeholder sender until a real domain is verified with Resend; the brand
-// polish pass in Phase 6 replaces the template. Kept in one place so swapping
-// the sender later is a one-line change.
-export const EMAIL_FROM = "Order Desk <onboarding@resend.dev>";
+import { DEFAULT_FROM, sendEmail } from "./send";
 
 export async function sendMagicLinkEmail(
   env: CloudflareEnv,
@@ -11,7 +6,7 @@ export async function sendMagicLinkEmail(
   url: string,
 ): Promise<void> {
   await sendEmail(env, {
-    from: EMAIL_FROM,
+    from: DEFAULT_FROM,
     to: [email],
     subject: "Sign in to Order Desk",
     html: [

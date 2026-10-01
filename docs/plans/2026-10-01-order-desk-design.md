@@ -168,3 +168,14 @@ keeps the PO as failed-draft with a retry button; never silent.
 - Resend API key (exists; currently in Shopify Flow headers).
 - Shopify custom app token for impactrentals (read_orders) pasted into settings.
 - A custom domain choice later (workers.dev subdomain first).
+
+## Amendment (Oct 1): email provider
+
+Cloudflare Email Service (Workers `send_email` binding, bound as `EMAIL`)
+replaces Resend as the email provider. Requirements: Workers Paid plan and an
+onboarded sending domain in Email Service before production email works
+(DEFAULT_FROM uses orders@impactrentals.store). Attachments are supported by
+the binding (base64 content with filename, MIME type, disposition), so Phase 7
+PO PDFs pass through unchanged. The Resend API key is no longer needed; local
+dev keeps the [email-fallback] console log. Resend references in the body
+above are historical.

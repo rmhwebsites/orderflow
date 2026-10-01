@@ -1,6 +1,6 @@
 BETTER_AUTH_SECRET=generate-with-openssl-rand-base64-32
 ENCRYPTION_KEY=generate-with-openssl-rand-base64-32
-RESEND_API_KEY=re_xxx
+# RESEND_API_KEY no longer used; Cloudflare Email Service binding sends in production
 VAPID_PUBLIC_KEY=
 VAPID_PRIVATE_KEY=
 VAPID_SUBJECT=mailto:ryan@rmhwebsites.com

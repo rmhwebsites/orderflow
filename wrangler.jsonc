@@ -16,6 +16,9 @@
     }
   ],
   "r2_buckets": [{ "binding": "PO_BUCKET", "bucket_name": "orderflow" }],
+  // Cloudflare Email Service send binding (requires Workers Paid and an
+  // onboarded sending domain before production email works)
+  "send_email": [{ "name": "EMAIL" }],
   "durable_objects": {
     "bindings": [{ "name": "ROOM", "class_name": "WorkspaceRoom" }]
   },
