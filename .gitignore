@@ -1,0 +1,23 @@
+# dependencies
+node_modules
+
+# next.js build output
+.next
+
+# opennext build output
+.open-next
+
+# wrangler local state
+.wrangler
+
+# local secrets
+.dev.vars
+*.env*
+
+# os
+.DS_Store
+
+# generated types and typescript build info
+cloudflare-env.d.ts
+next-env.d.ts
+*.tsbuildinfo
