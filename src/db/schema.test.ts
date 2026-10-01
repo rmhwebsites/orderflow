@@ -3,6 +3,10 @@ import Database from "better-sqlite3";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { is } from "drizzle-orm";
+import { SQLiteTable } from "drizzle-orm/sqlite-core";
+import { drizzle } from "drizzle-orm/better-sqlite3";
+import * as schema from "./schema";
 
 // Applies the real generated migrations to an in-memory SQLite database and
 // asserts the constraints the app relies on, so schema drift breaks the suite.
@@ -86,6 +90,23 @@ describe("schema migrations", () => {
     const names = rows.map((r) => (r as { name: string }).name);
     for (const table of APP_TABLES) {
       expect(names).toContain(table);
+    }
+  });
+
+  // Schema-vs-migration drift guard: selects every column of every exported
+  // table (app + auth + pending_invites) through drizzle against the migrated
+  // database. A column that exists in schema.ts but not in the migrations
+  // throws "no such column"; a table missing from the migrations throws
+  // "no such table".
+  it("matches every exported table and column to the migrations", () => {
+    const tables = (Object.values(schema) as unknown[]).filter(
+      (value): value is SQLiteTable => is(value, SQLiteTable),
+    );
+    // 11 app tables + pending_invites + user/session/account/verification.
+    expect(tables.length).toBe(16);
+    const orm = drizzle(db);
+    for (const table of tables) {
+      expect(() => orm.select().from(table).all()).not.toThrow();
     }
   });
 });

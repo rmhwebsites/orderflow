@@ -1,5 +1,7 @@
 import { sqliteTable, text, integer, uniqueIndex, index } from "drizzle-orm/sqlite-core";
 
+export * from "./auth-schema";
+
 export const workspaces = sqliteTable("workspaces", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
@@ -16,7 +18,10 @@ export const workspaceMembers = sqliteTable("workspace_members", {
   userId: text("user_id").notNull(),
   role: text("role", { enum: ["owner", "admin", "member"] }).notNull(),
   lastSeenAt: integer("last_seen_at").notNull().default(0),
-}, (t) => [uniqueIndex("member_unique").on(t.workspaceId, t.userId)]);
+}, (t) => [
+  uniqueIndex("member_unique").on(t.workspaceId, t.userId),
+  index("member_user").on(t.userId),
+]);
 
 export const storeConnections = sqliteTable("store_connections", {
   workspaceId: text("workspace_id").primaryKey().references(() => workspaces.id),
@@ -53,6 +58,7 @@ export const orders = sqliteTable("orders", {
 }, (t) => [
   uniqueIndex("order_unique").on(t.workspaceId, t.shopifyOrderId),
   index("order_ws_created").on(t.workspaceId, t.createdAt),
+  index("order_ws_status").on(t.workspaceId, t.statusKey),
 ]);
 
 export const events = sqliteTable("events", {
@@ -71,7 +77,7 @@ export const vendors = sqliteTable("vendors", {
   workspaceId: text("workspace_id").notNull().references(() => workspaces.id),
   name: text("name").notNull(),
   email: text("email").notNull(),
-  cc: text("cc", { mode: "json" }),
+  cc: text("cc", { mode: "json" }).$type<string[]>(),
   notes: text("notes"),
   archived: integer("archived", { mode: "boolean" }).notNull().default(false),
 });
@@ -90,11 +96,14 @@ export const purchaseOrders = sqliteTable("purchase_orders", {
   sentAt: integer("sent_at"),
   createdBy: text("created_by").notNull(),
   createdAt: integer("created_at").notNull(),
-}, (t) => [uniqueIndex("po_number_unique").on(t.workspaceId, t.poNumber)]);
+}, (t) => [
+  uniqueIndex("po_number_unique").on(t.workspaceId, t.poNumber),
+  index("po_order").on(t.orderId),
+]);
 
 export const workspaceSettings = sqliteTable("workspace_settings", {
   workspaceId: text("workspace_id").primaryKey().references(() => workspaces.id),
-  notificationEmails: text("notification_emails", { mode: "json" }).notNull().default("[]"),
+  notificationEmails: text("notification_emails", { mode: "json" }).$type<string[]>().notNull().default([]),
   poPrefix: text("po_prefix").notNull().default("PO"),
   replyTo: text("reply_to"),
   fromName: text("from_name"),
@@ -113,7 +122,16 @@ export const pushSubscriptions = sqliteTable("push_subscriptions", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull(),
   endpoint: text("endpoint").notNull().unique(),
-  keys: text("keys", { mode: "json" }).notNull(),
+  keys: text("keys", { mode: "json" }).$type<{ p256dh: string; auth: string }>().notNull(),
   userAgent: text("user_agent"),
   createdAt: integer("created_at").notNull(),
-});
+}, (t) => [index("push_user").on(t.userId)]);
+
+export const pendingInvites = sqliteTable("pending_invites", {
+  id: text("id").primaryKey(),
+  email: text("email").notNull(),
+  workspaceId: text("workspace_id").notNull().references(() => workspaces.id),
+  role: text("role", { enum: ["admin", "member"] }).notNull(),
+  invitedBy: text("invited_by").notNull(),
+  createdAt: integer("created_at").notNull(),
+}, (t) => [uniqueIndex("invite_unique").on(t.email, t.workspaceId)]);
