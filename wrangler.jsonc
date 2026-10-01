@@ -11,8 +11,7 @@
     {
       "binding": "DB",
       "database_name": "order_desk",
-      // TODO: replace database_id with the real id after `wrangler login` and `wrangler d1 create order_desk`
-      "database_id": "REPLACE_ME_AFTER_WRANGLER_LOGIN",
+      "database_id": "2b066c9a-0684-47eb-8672-c638cc6aaa2a",
       "migrations_dir": "drizzle"
     }
   ],
