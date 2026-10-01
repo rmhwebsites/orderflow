@@ -15,6 +15,13 @@
       "when": 1790872417518,
       "tag": "0001_boring_onslaught",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790874285678,
+      "tag": "0002_cool_vanisher",
+      "breakpoints": true
     }
   ]
 }

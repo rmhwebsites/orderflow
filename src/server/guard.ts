@@ -1,8 +1,9 @@
+import { cache } from "react";
 import { and, eq } from "drizzle-orm";
 import { headers } from "next/headers";
 import { NextResponse } from "next/server";
 import { getDb } from "@/db";
-import { workspaceMembers } from "@/db/schema";
+import { workspaceMembers, workspaces } from "@/db/schema";
 import { getAuth } from "./auth";
 
 export type Role = "owner" | "admin" | "member";
@@ -55,6 +56,27 @@ export async function requireMember(workspaceId: string, required: Role) {
   }
   return { userId, role: membership.role, db, session };
 }
+
+// Guard for /w/[slug] server components. EVERY server component under
+// /w/[slug] (layout, page, nested segments) must call this itself: layouts
+// are NOT an auth boundary, because Next renders layouts and pages
+// independently (and pages can be requested without their layout re-running).
+// cache() dedupes the session and membership queries across the components
+// of one request.
+export const requireMemberBySlug = cache(async (slug: string, required: Role) => {
+  const db = getDb();
+  const rows = await db
+    .select()
+    .from(workspaces)
+    .where(eq(workspaces.slug, slug))
+    .limit(1);
+  const workspace = rows[0];
+  if (!workspace) {
+    throw new AuthError(404, "Not found");
+  }
+  const { userId, role, session } = await requireMember(workspace.id, required);
+  return { workspace, userId, role, db, session };
+});
 
 export function guardResponse(e: unknown): NextResponse {
   if (e instanceof AuthError) {

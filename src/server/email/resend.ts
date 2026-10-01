@@ -21,16 +21,33 @@ function firstUrlIn(html: string): string | undefined {
   return match ? match[0] : undefined;
 }
 
+/**
+ * Sends an email through Resend.
+ *
+ * Convention for ALL templates (current and Phase 6/7, which interpolate
+ * customer and vendor data): every dynamic value interpolated into
+ * `opts.html` or `opts.subject` MUST be passed through escapeHtml from
+ * "./escape" at the call site. sendEmail does not escape for you, because it
+ * cannot tell markup from data.
+ *
+ * Dev fallback: only when APP_URL points at localhost AND the Resend key is
+ * missing or the placeholder, the email is logged instead of sent. Outside
+ * localhost a missing or placeholder key throws, so a misconfigured
+ * deployment fails loudly instead of silently dropping email.
+ */
 export async function sendEmail(
   env: CloudflareEnv,
   opts: SendEmailOptions,
 ): Promise<{ id: string }> {
   if (!env.RESEND_API_KEY || env.RESEND_API_KEY === PLACEHOLDER_KEY) {
-    console.log(
-      "[email-fallback]",
-      JSON.stringify({ to: opts.to, subject: opts.subject, url: firstUrlIn(opts.html) }),
-    );
-    return { id: "dev-fallback" };
+    if (env.APP_URL.startsWith("http://localhost")) {
+      console.log(
+        "[email-fallback]",
+        JSON.stringify({ to: opts.to, subject: opts.subject, url: firstUrlIn(opts.html) }),
+      );
+      return { id: "dev-fallback" };
+    }
+    throw new Error("RESEND_API_KEY is not configured");
   }
   const response = await fetch(RESEND_ENDPOINT, {
     method: "POST",

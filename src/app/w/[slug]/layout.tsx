@@ -1,11 +1,11 @@
 import { redirect } from "next/navigation";
-import { eq } from "drizzle-orm";
-import { getDb } from "@/db";
-import { workspaces } from "@/db/schema";
-import { AuthError, requireMember } from "@/server/guard";
+import { AuthError, requireMemberBySlug } from "@/server/guard";
 
 // Minimal shell until the full design system lands in Phase 5: a top bar with
 // the workspace accent and name, content below.
+//
+// Every /w/[slug] server component must call requireMemberBySlug itself;
+// layouts are not an auth boundary. The cache() wrapper dedupes the work.
 export default async function WorkspaceLayout({
   children,
   params,
@@ -14,31 +14,14 @@ export default async function WorkspaceLayout({
   params: Promise<{ slug: string }>;
 }) {
   const { slug } = await params;
-  const db = getDb();
-  const rows = await db
-    .select({
-      id: workspaces.id,
-      name: workspaces.name,
-      accentColor: workspaces.accentColor,
-    })
-    .from(workspaces)
-    .where(eq(workspaces.slug, slug))
-    .limit(1);
-  const workspace = rows[0];
-  if (!workspace) {
-    redirect("/");
-  }
-  let allowed = false;
+  let workspace: { name: string; accentColor: string };
   try {
-    await requireMember(workspace.id, "member");
-    allowed = true;
+    ({ workspace } = await requireMemberBySlug(slug, "member"));
   } catch (e) {
-    if (!(e instanceof AuthError)) {
-      throw e;
+    if (e instanceof AuthError) {
+      redirect("/");
     }
-  }
-  if (!allowed) {
-    redirect("/");
+    throw e;
   }
 
   return (

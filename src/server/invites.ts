@@ -27,23 +27,21 @@ export async function claimPendingInvites(
     .select()
     .from(pendingInvites)
     .where(eq(pendingInvites.email, normalized));
-  if (invites.length === 0) {
-    return;
-  }
-  const memberships = await db
-    .select({ workspaceId: workspaceMembers.workspaceId })
-    .from(workspaceMembers)
-    .where(eq(workspaceMembers.userId, userId));
-  const existing = new Set(memberships.map((m) => m.workspaceId));
   for (const invite of invites) {
-    if (!existing.has(invite.workspaceId)) {
-      await db.insert(workspaceMembers).values({
-        id: crypto.randomUUID(),
-        workspaceId: invite.workspaceId,
-        userId,
-        role: invite.role,
-      });
-    }
-    await db.delete(pendingInvites).where(eq(pendingInvites.id, invite.id));
+    // One atomic pair per claim: the insert ignores an already-existing
+    // membership (member_unique), and the invite row is deleted either way,
+    // so concurrent sign-ins cannot double-grant or strand an invite.
+    await db.batch([
+      db
+        .insert(workspaceMembers)
+        .values({
+          id: crypto.randomUUID(),
+          workspaceId: invite.workspaceId,
+          userId,
+          role: invite.role,
+        })
+        .onConflictDoNothing(),
+      db.delete(pendingInvites).where(eq(pendingInvites.id, invite.id)),
+    ]);
   }
 }

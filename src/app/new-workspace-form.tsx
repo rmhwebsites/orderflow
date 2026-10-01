@@ -16,19 +16,24 @@ export function NewWorkspaceForm() {
     }
     setBusy(true);
     setErrorMessage("");
-    const response = await fetch("/api/workspaces", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
-    });
-    if (response.ok) {
-      setName("");
-      router.refresh();
-    } else {
-      const data = (await response.json().catch(() => null)) as { error?: string } | null;
-      setErrorMessage(data?.error ?? "Could not create the workspace.");
+    try {
+      const response = await fetch("/api/workspaces", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      if (response.ok) {
+        setName("");
+        router.refresh();
+      } else {
+        const data = (await response.json().catch(() => null)) as { error?: string } | null;
+        setErrorMessage(data?.error ?? "Could not create the workspace.");
+      }
+    } catch {
+      setErrorMessage("Could not reach the server. Try again.");
+    } finally {
+      setBusy(false);
     }
-    setBusy(false);
   }
 
   return (

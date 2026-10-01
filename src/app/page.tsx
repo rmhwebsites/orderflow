@@ -1,10 +1,9 @@
 import Link from "next/link";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
-import { eq } from "drizzle-orm";
 import { getDb } from "@/db";
-import { workspaceMembers, workspaces } from "@/db/schema";
 import { getAuth } from "@/server/auth";
+import { listWorkspacesForUser } from "@/server/workspaces";
 import { NewWorkspaceForm } from "./new-workspace-form";
 
 export default async function Home() {
@@ -12,18 +11,7 @@ export default async function Home() {
   if (!session) {
     redirect("/sign-in");
   }
-  const db = getDb();
-  const rows = await db
-    .select({
-      id: workspaces.id,
-      name: workspaces.name,
-      slug: workspaces.slug,
-      accentColor: workspaces.accentColor,
-      role: workspaceMembers.role,
-    })
-    .from(workspaceMembers)
-    .innerJoin(workspaces, eq(workspaceMembers.workspaceId, workspaces.id))
-    .where(eq(workspaceMembers.userId, session.user.id));
+  const rows = await listWorkspacesForUser(getDb(), session.user.id);
 
   return (
     <main className="mx-auto flex min-h-screen max-w-lg flex-col gap-8 px-6 py-12 font-sans">
