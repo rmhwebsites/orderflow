@@ -53,9 +53,37 @@ running against commit 116a744. If its results are unknown to you:
   116a744 at HEAD will "fail" that item: expected, not a defect.
 - If the lenses found issues, fix via TDD and re-verify before deploying.
 
+## Verification verdict on 116a744 (arrived just before cutoff)
+
+Three-lens adversarial review completed. The core fixes HOLD (cursor chains
+keep a stable window and byte-identical search string; fenced writes are
+atomic; recovery is lossless; the livelock regression test is honest; fence
+values cannot collide; applyPair/changesOf read D1 batch results correctly;
+EXISTENCE_CHUNK=50 pinned). Remaining findings, FIX BEFORE DEPLOY:
+
+1. IMPORTANT (src/server/sync/run.ts ~line 338): the lease fence covers only
+   store_connections; the orders snapshot UPDATE is unfenced. A zombie run
+   that outlives its 120s lease (fetch budget allows ~900s) can land an OLD
+   snapshot over a newer run's write, permanently (the advanced window never
+   re-covers it), and still reports updated/updatedOrderIds despite
+   superseded=true (would drive false Phase 5/6 broadcasts). Fix: make the
+   snapshot update conditional (add lte(orders.syncedAt, now) to its where,
+   count it only via changesOf like the insert path), and return empty
+   added/updated arrays from any run whose terminal write was superseded.
+2. MINOR (~line 373): after a completed cursor continuation, anchor lastSyncAt
+   at the run's own pre-fetch `now` instead of the chain watermark; keeps a
+   >500-order same-moment burst from causing a perpetual 2-tick rescan cycle
+   on an idle shop (churn, not loss).
+3. MINOR (~line 161): move the post-CAS fresh connection read inside the try
+   block so a transient D1 error there cannot leak the lease until expiry.
+
+Write failing tests first (the lenses left repro sketches: a zombie-run test
+and the rescan-cycle observation in the existing invariant test), fix, run the
+full gate, commit with the usual trailer, push, THEN do the smoke deploy.
+
 ## Immediate next steps, in order
 
-1. Resolve any findings from the verification above.
+1. Fix the three findings above (TDD), re-run npm run test + tsc.
 2. SMOKE DEPLOY (early, agreed with Ryan) - exact sequence:
    a. `openssl rand -base64 32 | npx wrangler secret put BETTER_AUTH_SECRET`
       (same for ENCRYPTION_KEY; `openssl rand -hex 16` for CRON_SECRET).
