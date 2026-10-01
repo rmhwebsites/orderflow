@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "order-desk",
+  "main": "custom-worker.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": { "directory": ".open-next/assets", "binding": "ASSETS" },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "order_desk",
+      // TODO: replace database_id with the real id after `wrangler login` and `wrangler d1 create order_desk`
+      "database_id": "REPLACE_ME_AFTER_WRANGLER_LOGIN",
+      "migrations_dir": "drizzle"
+    }
+  ],
+  "r2_buckets": [{ "binding": "PO_BUCKET", "bucket_name": "order-desk-pdfs" }],
+  "durable_objects": {
+    "bindings": [{ "name": "ROOM", "class_name": "WorkspaceRoom" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceRoom"] }],
+  "triggers": { "crons": ["*/10 * * * *"] },
+  "vars": { "APP_URL": "http://localhost:3000" }
+}
