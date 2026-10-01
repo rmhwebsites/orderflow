@@ -2,7 +2,7 @@
 // Relative imports on purpose: this module is bundled into the custom worker
 // entrypoint (cron), not only the Next.js build.
 
-import { and, asc, desc, eq, inArray, lte } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, lt, lte } from "drizzle-orm";
 import type { Db } from "../../db";
 import { events, orders, statuses, storeConnections } from "../../db/schema";
 import { decryptSecret } from "../crypto";
@@ -101,23 +101,25 @@ type ConnectionWrite = Partial<typeof storeConnections.$inferInsert>;
 // match, nothing is written, and the caller reports superseded.
 //
 // What the fence protects: the store_connections row only (status, lastError,
-// lastSyncAt, the sync cursor pair, and the lease release itself). A run that
-// outlived its lease can never overwrite a newer run's connection state or
-// free a lease it no longer owns.
+// lastSyncAt, the sync cursor fields, and the lease release itself). A run
+// that outlived its lease can never overwrite a newer run's connection state
+// or free a lease it no longer owns.
 //
 // What the fence does NOT protect: writes to orders and events. Those happen
 // before the terminal write and are not lease-checked, so a superseded run's
 // rows can still land. They are made safe on their own terms instead:
 // - order + order_new event inserts are conflict no-ops with a deterministic
 //   event id, so a replay or a racing run inserts nothing twice;
-// - the snapshot UPDATE is monotonic on synced_at (it only matches rows whose
-//   synced_at is at or before this run's now), so a stale run cannot regress a
-//   snapshot written by a run that started later;
+// - stored snapshots follow claim-then-read (see claimAndLoad): the run that
+//   started latest owns every order row it has looked at, whether or not it
+//   had anything to write there, and an older run's snapshot UPDATE matches
+//   no such row;
 // - added / updated counts and ids come from rows-affected, so a write that
 //   was a no-op or was guarded away is never reported.
-// The synced_at guard orders runs by start time, not by fetch time: a zombie's
-// snapshot is dropped even when it was fetched after the newer run's, and the
-// next window (lastSyncAt minus overlap) picks that change up again.
+// Ownership orders runs by start time, not by fetch time: a zombie's snapshot
+// is dropped even when it was fetched after the newer run's. That is safe
+// because such a change happened after the newer run's now, so the next
+// window (lastSyncAt minus overlap) picks it up again.
 async function fencedConnectionWrite(
   db: Db,
   workspaceId: string,
@@ -134,6 +136,45 @@ async function fencedConnectionWrite(
       ),
     );
   return changesOf(result) > 0;
+}
+
+type KnownOrder = { id: string; shopify: unknown };
+
+// Claim, then read. orders.synced_at is the start time (now) of the latest
+// run that has looked at the row. Before a run reads stored snapshots to
+// compare them with what it fetched, it stamps its own now on those rows,
+// forward only (never over a later run's stamp). From that statement on, no
+// run that started earlier can change them: its claim needs synced_at below,
+// and its snapshot UPDATE synced_at at or below, its own smaller now. So
+// what this run reads afterwards is stable against every older run, and a
+// row it then leaves alone because the snapshots match stays protected
+// exactly like a row it rewrites. Stamping only after the compare would not
+// do: an older run's write could land between the read and the stamp and be
+// blessed by it.
+// One claim UPDATE plus one SELECT per chunk of ids, both inside the D1
+// bound-parameter cap.
+async function claimAndLoad(
+  db: Db,
+  workspaceId: string,
+  shopifyIds: string[],
+  now: number,
+  into: Map<string, KnownOrder>,
+): Promise<void> {
+  const inChunk = and(
+    eq(orders.workspaceId, workspaceId),
+    inArray(orders.shopifyOrderId, shopifyIds),
+  );
+  await db
+    .update(orders)
+    .set({ syncedAt: now })
+    .where(and(inChunk, lt(orders.syncedAt, now)));
+  const rows = await db
+    .select({ id: orders.id, shopifyOrderId: orders.shopifyOrderId, shopify: orders.shopify })
+    .from(orders)
+    .where(inChunk);
+  for (const row of rows) {
+    into.set(row.shopifyOrderId, { id: row.id, shopify: row.shopify });
+  }
 }
 
 export async function runSync(
@@ -248,7 +289,7 @@ export async function runSync(
         lastError: detail,
         runningUntil: 0,
         ...(fetched.kind === "fatal" && resuming
-          ? { syncCursor: null, syncCursorSince: null }
+          ? { syncCursor: null, syncCursorSince: null, syncCursorStartedAt: null }
           : {}),
       });
       if (!held) {
@@ -294,26 +335,21 @@ export async function runSync(
       .limit(1);
     const defaultStatusKey = defaultStatusRows[0]?.key ?? "new";
 
-    // Existence map in chunks instead of one SELECT per order; maintained
-    // inside the loop so a duplicate within the batch takes the update path.
-    const existingByShopifyId = new Map<string, { id: string; shopify: unknown }>();
+    // Existence map in chunks instead of one SELECT per order (each chunk is
+    // claimed before it is read, see claimAndLoad); maintained inside the loop
+    // so a duplicate within the batch takes the update path.
+    const existingByShopifyId = new Map<string, KnownOrder>();
     const shopifyIds = normalized.map((order) => order.shopifyOrderId);
     for (let i = 0; i < shopifyIds.length; i += EXISTENCE_CHUNK) {
       const chunk = shopifyIds.slice(i, i + EXISTENCE_CHUNK);
-      const rows = await db
-        .select({ id: orders.id, shopifyOrderId: orders.shopifyOrderId, shopify: orders.shopify })
-        .from(orders)
-        .where(and(eq(orders.workspaceId, workspaceId), inArray(orders.shopifyOrderId, chunk)));
-      for (const row of rows) {
-        existingByShopifyId.set(row.shopifyOrderId, { id: row.id, shopify: row.shopify });
-      }
+      await claimAndLoad(db, workspaceId, chunk, now, existingByShopifyId);
     }
 
     const addedSet = new Set<string>();
     const updatedSet = new Set<string>();
 
     for (const order of normalized) {
-      const existing = existingByShopifyId.get(order.shopifyOrderId);
+      let existing = existingByShopifyId.get(order.shopifyOrderId);
 
       if (!existing) {
         const orderId = crypto.randomUUID();
@@ -351,18 +387,29 @@ export async function runSync(
           addedOrderIds.push(orderId);
           addedSet.add(orderId);
           existingByShopifyId.set(order.shopifyOrderId, { id: orderId, shopify: order });
+          continue;
         }
-      } else if (JSON.stringify(existing.shopify) !== JSON.stringify(order)) {
+        // The insert was a conflict no-op: another run stored this order after
+        // our existence read, possibly from an older fetch than ours. Claim
+        // and load that row, then treat it like any other existing order.
+        await claimAndLoad(db, workspaceId, [order.shopifyOrderId], now, existingByShopifyId);
+        existing = existingByShopifyId.get(order.shopifyOrderId);
+        if (!existing) {
+          continue;
+        }
+      }
+
+      if (JSON.stringify(existing.shopify) !== JSON.stringify(order)) {
         // Stable diff: normalizeOrders builds keys in one fixed order and JSON
         // parse/stringify round-trips preserve it, so equal snapshots always
         // stringify identically.
         // Refresh the snapshot only. statusKey / statusSetBy / statusSetAt are
         // the team's own fields and a sync must never clobber them, and an
         // updated snapshot gets no new event (order_new is for new orders only).
-        // Monotonic on synced_at: the orders table is outside the lease fence,
-        // so a run that outlived its lease may still get here. It must not
-        // regress a snapshot written by a run that started later, hence the
-        // synced_at <= now condition; rows-affected says whether it landed.
+        // Guarded on synced_at: the orders table is outside the lease fence,
+        // so a run that outlived its lease may still get here. A row claimed
+        // or written by a run that started later carries a larger synced_at
+        // and does not match; rows-affected says whether the write landed.
         const snapshotResult = await db
           .update(orders)
           .set({ shopify: order, syncedAt: now })
@@ -381,39 +428,59 @@ export async function runSync(
       }
     }
 
+    // When the window this run worked on was opened: this run's own now for
+    // a fresh window, the now of the opening tick for a resumed cursor chain.
+    // A persisted cursor without a recorded start degrades to the untouched
+    // lastSyncAt, which is never later than the true start.
+    const windowOpenedAt = resuming
+      ? (connection.syncCursorStartedAt ?? connection.lastSyncAt)
+      : now;
+
     let terminal: ConnectionWrite;
     if (fetched.truncated && fetched.endCursor) {
-      // Stopped at the page cap: persist the cursor and its window; progress
-      // is carried by the cursor, so lastSyncAt stays untouched until the
-      // window is fully drained.
+      // Stopped at the page cap: persist the cursor, its window and when the
+      // chain was opened; progress is carried by the cursor, so lastSyncAt
+      // stays untouched until the window is fully drained.
       terminal = {
         syncCursor: fetched.endCursor,
         syncCursorSince: sinceMs,
+        syncCursorStartedAt: windowOpenedAt,
         runningUntil: 0,
         status: "ok",
         lastError: null,
       };
     } else {
       // Window complete (or truncated with no cursor to resume from, where
-      // the watermark is the only anchor). Anchoring rules:
-      // - completed window, plain or resumed from a cursor: this run's now,
-      //   captured before the fetch began. The ascending cursor chain has
-      //   drained everything updated up to that moment, and anchoring a
-      //   finished continuation at its watermark instead would re-fetch a
-      //   dense burst sitting inside the overlap on every other tick forever;
+      // the watermark is the only anchor). One rule holds for every case:
+      // lastSyncAt never moves past the moment the window was opened.
+      // Shopify's updated_at search can surface an order late, so a fetch
+      // only vouches for orders that were searchable when it passed their
+      // sort position, and no fetch of this window ran before it was opened.
+      // The next window starts at the anchor minus the overlap, so an order
+      // is re-read unless it surfaced more than the overlap after its update.
+      // - completed plain window: this run's now, captured before the fetch;
+      // - completed cursor chain: the opening tick's now, not the finishing
+      //   tick's. The cursor never returns to an order that surfaced behind
+      //   it, so anchoring at the finishing tick would skip such an order for
+      //   good. Not the chain watermark either: that re-fetches a dense burst
+      //   inside the overlap on every other tick forever, whereas the chain
+      //   start costs at most a bounded re-scan, because each new chain opens
+      //   strictly later than the one before;
       // - truncated without cursor: the max updatedAt seen (the client
-      //   guarantees one), falling back to the previous lastSyncAt should it
-      //   ever be missing or unparseable, never now.
+      //   guarantees one; the previous lastSyncAt stands in should it ever be
+      //   missing or unparseable), capped at the window opening.
       const watermarkMs = fetched.maxUpdatedAt ? Date.parse(fetched.maxUpdatedAt) : NaN;
+      const watermarkAnchor = Number.isNaN(watermarkMs) ? connection.lastSyncAt : watermarkMs;
       const anchor = fetched.truncated
-        ? Number.isNaN(watermarkMs)
-          ? connection.lastSyncAt
-          : watermarkMs
-        : now;
+        ? Math.min(watermarkAnchor, windowOpenedAt)
+        : resuming
+          ? Math.max(connection.lastSyncAt, windowOpenedAt)
+          : now;
       terminal = {
         lastSyncAt: anchor,
         syncCursor: null,
         syncCursorSince: null,
+        syncCursorStartedAt: null,
         runningUntil: 0,
         status: "ok",
         lastError: null,

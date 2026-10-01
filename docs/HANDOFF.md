@@ -24,8 +24,10 @@ Branch: build/m1-core. All work is committed and pushed through 116a744
 - Phase 0 scaffold, Phase 1 data layer, Phase 2 auth/workspaces/invites,
   Phase 3 sync engine: implemented, each through a two-gate review
   (spec compliance, then code quality), all requested fixes applied.
-- 105 tests green (`npm run test` = drizzle-kit check + vitest), tsc clean.
-- Migrations 0000-0003 applied BOTH locally and to remote D1.
+- 117 tests green (`npm run test` = drizzle-kit check + vitest), tsc clean.
+- Migrations 0000-0003 applied BOTH locally and to remote D1. Migration 0004
+  (store_connections.sync_cursor_started_at) is committed but NOT applied
+  anywhere yet: see "Sync review repairs, round 1" below.
 - Local end-to-end evidence exists for: magic-link sign-in, workspace create
   with 7 default statuses, invite claim (both paths), revocation, sync engine
   (idempotent, cursor-resumed pagination, fenced lease) via simulator tests.
@@ -81,9 +83,41 @@ Write failing tests first (the lenses left repro sketches: a zombie-run test
 and the rescan-cycle observation in the existing invariant test), fix, run the
 full gate, commit with the usual trailer, push, THEN do the smoke deploy.
 
+## Sync review repairs, round 1 (supersedes parts of the verdict above)
+
+The three findings above were fixed in 84b3266. A second adversarial review of
+that commit found two real defects, both repaired test-first:
+
+1. Zombie hole on unchanged rows. The synced_at guard only protected rows a
+   newer run had WRITTEN; a row the newer run merely verified as unchanged
+   kept its old synced_at and a zombie's stale snapshot could still land.
+   Now runSync follows claim-then-read (claimAndLoad in run.ts): each chunk of
+   fetched order ids is stamped synced_at = this run's now (forward only)
+   BEFORE the stored snapshots are read, so the latest-started run owns every
+   row it looked at. An insert that turns out to be a conflict no-op (another
+   run stored the order first) now claims, loads and compares that row
+   instead of skipping it. orders.synced_at therefore means "start time of
+   the latest run that looked at this row", not "last snapshot write".
+2. Finding 2 above ("anchor at the run's own now after a continuation") was
+   WRONG when Shopify's updated_at search surfaces an order late: the cursor
+   never returns to an order that appears behind it, and the finishing tick's
+   now put the next window after it, losing the order for good. Rule now:
+   lastSyncAt never moves past the moment the window was opened. A completed
+   cursor chain anchors at the now of the tick that OPENED the chain
+   (store_connections.sync_cursor_started_at, migration 0004); a cursorless
+   truncation anchors at min(watermark, window opening). Cost: at most one
+   bounded re-scan after a dense burst, then one request per tick. Do not
+   "simplify" this back to the finishing tick's now or to the chain watermark.
+
+DEPLOY BLOCKER: migration 0004 must be applied before the new code runs, or
+every runSync fails on the whole-row store_connections read (no such column).
+Run `npm run db:migrate:local` for local dev and `npm run db:migrate:remote`
+before the smoke deploy. Neither has been run yet.
+
 ## Immediate next steps, in order
 
-1. Fix the three findings above (TDD), re-run npm run test + tsc.
+1. Apply migration 0004 locally and to remote D1 (see the deploy blocker
+   above), re-run npm run test + tsc.
 2. SMOKE DEPLOY (early, agreed with Ryan) - exact sequence:
    a. `openssl rand -base64 32 | npx wrangler secret put BETTER_AUTH_SECRET`
       (same for ENCRYPTION_KEY; `openssl rand -hex 16` for CRON_SECRET).

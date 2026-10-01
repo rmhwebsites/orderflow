@@ -29,6 +29,13 @@
       "when": 1790878489733,
       "tag": "0003_low_romulus",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1790891770577,
+      "tag": "0004_sync_cursor_started_at",
+      "breakpoints": true
     }
   ]
 }

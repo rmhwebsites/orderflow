@@ -4,7 +4,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { drizzle } from "drizzle-orm/better-sqlite3";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, lt } from "drizzle-orm";
 import type { Db } from "../../db";
 import * as schema from "../../db/schema";
 import { encryptSecret } from "../crypto";
@@ -217,6 +217,59 @@ function shopifySim(dataset: SimOrder[], opts?: { rejectCursors?: boolean }) {
   return { impl, count: () => requests };
 }
 
+type LaggyOrder = SimOrder & { visibleAtMs?: number };
+
+// Shopify simulator whose updated_at search index lags: an order is only
+// returned once the injected clock has reached its visibleAtMs. Cursors are
+// keyset positions (updatedAt, id), like Shopify's own, so an order that
+// surfaces behind a cursor is never returned by that cursor's chain.
+function laggyShopifySim(dataset: LaggyOrder[], clock: () => number) {
+  let requests = 0;
+  const impl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    requests++;
+    const vars = (JSON.parse(String(init?.body ?? "{}")) as {
+      variables: { cursor: string | null; search: string };
+    }).variables;
+    const sinceMs = Date.parse(vars.search.match(/'(.*)'/)![1]);
+    const after = vars.cursor ? vars.cursor.split(":").slice(1).map(Number) : null;
+    const remaining = dataset
+      .filter((o) => o.updatedAtMs >= sinceMs && (o.visibleAtMs ?? 0) <= clock())
+      .filter(
+        (o) =>
+          after === null ||
+          o.updatedAtMs > after[0] ||
+          (o.updatedAtMs === after[0] && o.idNum > after[1]),
+      )
+      .sort((a, b) => a.updatedAtMs - b.updatedAtMs || a.idNum - b.idNum);
+    const page = remaining.slice(0, 50);
+    const last = page[page.length - 1];
+    const nodes = page.map((o) => ({
+      id: `gid://shopify/Order/${o.idNum}`,
+      legacyResourceId: String(o.idNum),
+      name: `#${o.idNum}`,
+      createdAt: new Date(o.updatedAtMs - 1000).toISOString(),
+      updatedAt: new Date(o.updatedAtMs).toISOString(),
+      tags: [],
+      lineItems: { nodes: [] },
+    }));
+    return new Response(
+      JSON.stringify({
+        data: {
+          orders: {
+            nodes,
+            pageInfo: {
+              hasNextPage: remaining.length > page.length,
+              endCursor: last ? `key:${last.updatedAtMs}:${last.idNum}` : vars.cursor,
+            },
+          },
+        },
+      }),
+      { status: 200 },
+    );
+  }) as typeof fetch;
+  return { impl, count: () => requests };
+}
+
 // Proxy whose existence query sees nothing, simulating a racing run that
 // inserted the same orders after this run built its existence map.
 function withBlindExistenceCheck(db: Db): Db {
@@ -325,6 +378,72 @@ function withFailingBareSelect(db: Db, failOnCall: number, message: string): Db 
             }
           }
           return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  }) as unknown as Db;
+}
+
+// Starts a run whose fetch parks until finish() is called: a zombie that is
+// still alive after its 120 second lease has expired. Resolves once the run
+// holds the lease and is parked inside its fetch.
+async function parkedZombie(db: Db, env: CloudflareEnv, at: number, nodes: unknown[]) {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let parked!: () => void;
+  const atFetch = new Promise<void>((resolve) => {
+    parked = resolve;
+  });
+  const page = pageFetch(nodes);
+  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    parked();
+    await gate;
+    return page.impl(input, init);
+  }) as typeof fetch;
+  const done = runSync(db, env, WS, { fetchImpl, now: () => at });
+  await Promise.race([atFetch, done]);
+  return {
+    finish: async () => {
+      release();
+      return done;
+    },
+  };
+}
+
+// Proxy that runs a hook right after this run's first existence read has
+// resolved and before the run acts on it: the exact gap in which another
+// run's order writes can land unseen. The read itself passes through.
+function withHookAfterExistenceRead(db: Db, hook: () => Promise<void>): Db {
+  let fired = false;
+  return new Proxy(db as object, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop);
+      if (prop === "select") {
+        return (...args: unknown[]) => {
+          const builder = (value as (...a: unknown[]) => unknown).apply(target, args) as {
+            from: (table: unknown) => { where: (condition: unknown) => PromiseLike<unknown[]> };
+          };
+          const fields = args[0] as Record<string, unknown> | undefined;
+          if (!fields || !("shopifyOrderId" in fields)) {
+            return builder;
+          }
+          return {
+            from: (table: unknown) => ({
+              where: async (condition: unknown) => {
+                const rows = await builder.from(table).where(condition);
+                if (!fired) {
+                  fired = true;
+                  await hook();
+                }
+                return rows;
+              },
+            }),
+          };
         };
       }
       return typeof value === "function"
@@ -586,6 +705,110 @@ describe("runSync", () => {
     expect((existing?.shopify as { note: string }).note).toBe("fresh note from run B");
     expect(existing?.syncedAt).toBe(LATER);
     expect(await eventsIn(db, WS, "order_new")).toHaveLength(2);
+  });
+
+  it("a zombie run cannot regress a row a newer run verified as unchanged", async () => {
+    const { db, env } = await makeDb();
+    await runSync(db, env, WS, {
+      fetchImpl: pageFetch([rileyNode]).impl,
+      now: () => NOW - 600000,
+    });
+
+    // Zombie run A (started at NOW) fetched the order mid-flap: a note edit
+    // that was undone in Shopify a minute later. Run B (started at LATER)
+    // fetches the reverted order, which equals the stored snapshot, so B has
+    // no snapshot to write. Only then does A's fetch return.
+    const flapped = { ...rileyNode, note: "edit that Shopify reverted" };
+    const flappedPage = pageFetch([flapped]);
+    let runB: SyncResult | undefined;
+    const zombieFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      runB = await runSync(db, env, WS, {
+        fetchImpl: pageFetch([rileyNode]).impl,
+        now: () => LATER,
+      });
+      return flappedPage.impl(input, init);
+    }) as typeof fetch;
+
+    const runA = await runSync(db, env, WS, { fetchImpl: zombieFetch, now: () => NOW });
+
+    expect(runB?.updated).toBe(0);
+    expect(runB?.updatedOrderIds).toEqual([]);
+    expect(runB?.superseded).toBeUndefined();
+
+    // B verified the row as current, so A's stale snapshot must not land and
+    // must not be reported.
+    const rows = await ordersIn(db, WS);
+    expect(rows).toHaveLength(1);
+    expect((rows[0].shopify as { note: string }).note).toBe("original note");
+    expect(rows[0].syncedAt).toBe(LATER);
+    expect(runA.updated).toBe(0);
+    expect(runA.updatedOrderIds).toEqual([]);
+    expect(runA.superseded).toBe(true);
+    expect((await connectionOf(db, WS)).lastSyncAt).toBe(LATER);
+  });
+
+  it("a zombie write landing between a newer run's read and its verification cannot stick", async () => {
+    const { db, env } = await makeDb();
+    await runSync(db, env, WS, {
+      fetchImpl: pageFetch([rileyNode]).impl,
+      now: () => NOW - 600000,
+    });
+
+    // Same flap, tighter interleaving: zombie A's whole write loop runs after
+    // run B has read the stored snapshot and before B acts on what it read.
+    const flapped = { ...rileyNode, note: "edit that Shopify reverted" };
+    const zombie = await parkedZombie(db, env, NOW, [flapped]);
+    let runA: SyncResult | undefined;
+    const racing = withHookAfterExistenceRead(db, async () => {
+      runA = await zombie.finish();
+    });
+    const runB = await runSync(racing, env, WS, {
+      fetchImpl: pageFetch([rileyNode]).impl,
+      now: () => LATER,
+    });
+
+    expect(runB.superseded).toBeUndefined();
+    expect(runA?.superseded).toBe(true);
+    const rows = await ordersIn(db, WS);
+    expect(rows).toHaveLength(1);
+    expect((rows[0].shopify as { note: string }).note).toBe("original note");
+    expect(rows[0].syncedAt).toBe(LATER);
+    expect(runA?.updated).toBe(0);
+    expect(runA?.updatedOrderIds).toEqual([]);
+    expect(runB.updated).toBe(0);
+  });
+
+  it("a newer run still applies its snapshot when a zombie inserts the order first", async () => {
+    const { db, env } = await makeDb();
+    // Nobody has stored the order yet. Zombie A fetched it before an edit,
+    // run B after. A's insert lands after B's existence read (B saw no row)
+    // and before B's own insert, which then conflicts.
+    const staleUnseen = { ...rileyNode, note: "note before the edit" };
+    const freshUnseen = { ...rileyNode, note: "note after the edit" };
+    const zombie = await parkedZombie(db, env, NOW, [staleUnseen]);
+    let runA: SyncResult | undefined;
+    const racing = withHookAfterExistenceRead(db, async () => {
+      runA = await zombie.finish();
+    });
+    const runB = await runSync(racing, env, WS, {
+      fetchImpl: pageFetch([freshUnseen]).impl,
+      now: () => LATER,
+    });
+
+    const rows = await ordersIn(db, WS);
+    expect(rows).toHaveLength(1);
+    // The insert was A's (and is reported by A); the snapshot is B's.
+    expect(runA?.added).toBe(1);
+    expect(runA?.addedOrderIds).toEqual([rows[0].id]);
+    expect(runA?.superseded).toBe(true);
+    expect((rows[0].shopify as { note: string }).note).toBe("note after the edit");
+    expect(rows[0].syncedAt).toBe(LATER);
+    expect(runB.error).toBeUndefined();
+    expect(runB.added).toBe(0);
+    expect(runB.addedOrderIds).toEqual([]);
+    expect(runB.updated).toBe(1);
+    expect(runB.updatedOrderIds).toEqual([rows[0].id]);
+    expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
   });
 
   it("counts a landed snapshot update from the D1 result shape", async () => {
@@ -907,6 +1130,7 @@ describe("runSync", () => {
     const afterTruncated = await connectionOf(db, WS);
     expect(afterTruncated.syncCursor).toBe("idx:500");
     expect(afterTruncated.syncCursorSince).toBe(previousSync - OVERLAP_MS);
+    expect(afterTruncated.syncCursorStartedAt).toBe(T + 700 * 60000);
     expect(afterTruncated.lastSyncAt).toBe(previousSync);
     expect(afterTruncated.status).toBe("ok");
 
@@ -916,9 +1140,12 @@ describe("runSync", () => {
     const afterComplete = await connectionOf(db, WS);
     expect(afterComplete.syncCursor).toBeNull();
     expect(afterComplete.syncCursorSince).toBeNull();
-    // A completed continuation anchors at its own run's now (the cursor chain
-    // has drained everything up to that moment), not at the chain watermark.
-    expect(afterComplete.lastSyncAt).toBe(T + 701 * 60000);
+    expect(afterComplete.syncCursorStartedAt).toBeNull();
+    // A completed continuation anchors at the now of the tick that opened the
+    // chain, not at the finishing tick's now and not at the chain watermark:
+    // the next window (anchor minus overlap) must start before the chain did,
+    // or orders the search index surfaced behind the cursor are never read.
+    expect(afterComplete.lastSyncAt).toBe(T + 700 * 60000);
     expect(await ordersIn(db, WS)).toHaveLength(620);
   });
 
@@ -991,6 +1218,198 @@ describe("runSync", () => {
     expect(await ordersIn(db, WS)).toHaveLength(550);
   });
 
+  it("carries the chain start unchanged through a multi-tick chain and anchors there", async () => {
+    const { db, env } = await makeDb();
+    const T = Date.parse("2026-09-25T12:00:00.000Z");
+    const previousSync = T - 3600000;
+    const dataset: SimOrder[] = Array.from({ length: 1100 }, (_, i) => ({
+      idNum: i + 1,
+      updatedAtMs: T + (i + 1) * 1000,
+    }));
+    await db
+      .update(schema.storeConnections)
+      .set({ lastSyncAt: previousSync })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    const sim = shopifySim(dataset);
+    const tickAt = (tick: number) => T + 3600000 + tick * 600000;
+
+    await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => tickAt(1) });
+    const afterOpen = await connectionOf(db, WS);
+    expect(afterOpen.syncCursor).toBe("idx:500");
+    expect(afterOpen.syncCursorStartedAt).toBe(tickAt(1));
+
+    // Still truncated: the cursor advances, the window and the chain start
+    // stay exactly as the opening tick wrote them.
+    await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => tickAt(2) });
+    const afterMiddle = await connectionOf(db, WS);
+    expect(afterMiddle.syncCursor).toBe("idx:1000");
+    expect(afterMiddle.syncCursorSince).toBe(previousSync - OVERLAP_MS);
+    expect(afterMiddle.syncCursorStartedAt).toBe(tickAt(1));
+    expect(afterMiddle.lastSyncAt).toBe(previousSync);
+
+    await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => tickAt(3) });
+    const afterComplete = await connectionOf(db, WS);
+    expect(afterComplete.syncCursor).toBeNull();
+    expect(afterComplete.syncCursorSince).toBeNull();
+    expect(afterComplete.syncCursorStartedAt).toBeNull();
+    expect(afterComplete.lastSyncAt).toBe(tickAt(1));
+    expect(await ordersIn(db, WS)).toHaveLength(1100);
+  });
+
+  it("re-covers an order the search index surfaced behind a persisted cursor", async () => {
+    const { db, env } = await makeDb();
+    const T = Date.parse("2026-09-25T12:00:00.000Z");
+    // 600 orders created by one bulk action in the same second. Order 300
+    // reaches the updated_at search index 90 seconds late.
+    const dataset: LaggyOrder[] = Array.from({ length: 600 }, (_, i) => ({
+      idNum: i + 1,
+      updatedAtMs: T,
+      ...(i + 1 === 300 ? { visibleAtMs: T + 90000 } : {}),
+    }));
+    await db
+      .update(schema.storeConnections)
+      .set({ lastSyncAt: T - 3600000 })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    let clock = 0;
+    const sim = laggyShopifySim(dataset, () => clock);
+    const tick = async (at: number) => {
+      clock = at;
+      const before = sim.count();
+      const result = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => at });
+      expect(result.error).toBeUndefined();
+      return { result, requests: sim.count() - before };
+    };
+    const tickAt = (n: number) => T + 60000 + (n - 1) * 600000;
+
+    // Tick 1 lands 60 seconds into the burst: order 300 is not searchable
+    // yet, so the page cap falls after order 501 and the persisted cursor
+    // already sits past order 300's sort position.
+    const t1 = await tick(tickAt(1));
+    expect(t1.result.added).toBe(500);
+    expect((await ordersIn(db, WS)).some((o) => o.shopifyOrderId === "300")).toBe(false);
+
+    // Tick 2 resumes from the cursor and finishes the chain without ever
+    // seeing order 300. The chain anchors at tick 1's now, so tick 3's window
+    // still starts before the burst.
+    const t2 = await tick(tickAt(2));
+    expect(t2.result.added).toBe(99);
+    expect((await connectionOf(db, WS)).lastSyncAt).toBe(tickAt(1));
+
+    // Ticks 3 and 4 are the one bounded re-scan that picks the straggler up:
+    // ten pages up to the cap, then the two pages holding the last 100.
+    const t3 = await tick(tickAt(3));
+    expect(t3.result.added).toBe(1);
+    expect(t3.requests).toBe(10);
+    const t4 = await tick(tickAt(4));
+    expect(t4.result.added).toBe(0);
+    expect(t4.requests).toBe(2);
+    expect((await connectionOf(db, WS)).lastSyncAt).toBe(tickAt(3));
+
+    const rows = await ordersIn(db, WS);
+    expect(rows).toHaveLength(600);
+    expect(rows.some((o) => o.shopifyOrderId === "300")).toBe(true);
+
+    // After that the shop is idle and every tick is one cheap request again.
+    for (let n = 5; n <= 7; n++) {
+      const idle = await tick(tickAt(n));
+      expect(idle.requests).toBe(1);
+      expect(idle.result.added).toBe(0);
+      expect(idle.result.updated).toBe(0);
+      const connection = await connectionOf(db, WS);
+      expect(connection.syncCursor).toBeNull();
+      expect(connection.syncCursorStartedAt).toBeNull();
+      expect(connection.lastSyncAt).toBe(tickAt(n));
+    }
+    expect(await ordersIn(db, WS)).toHaveLength(600);
+  });
+
+  it("never anchors a cursorless truncation past the moment its window was opened", async () => {
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const cursorless = (updatedAtMs: number) =>
+      scriptedFetch([
+        {
+          nodes: [{ ...rileyNode, updatedAt: iso(updatedAtMs) }],
+          hasNextPage: true,
+          endCursor: null,
+        },
+      ]);
+
+    // Fresh window, watermark behind the run's now: the watermark anchors.
+    const behind = await makeDb();
+    await runSync(behind.db, behind.env, WS, {
+      fetchImpl: cursorless(NOW - 120000).impl,
+      now: () => NOW,
+    });
+    expect((await connectionOf(behind.db, WS)).lastSyncAt).toBe(NOW - 120000);
+
+    // Fresh window, watermark ahead of the run's now (an order updated while
+    // the fetch was in flight): the run's own now caps the anchor.
+    const ahead = await makeDb();
+    await runSync(ahead.db, ahead.env, WS, {
+      fetchImpl: cursorless(NOW + 30000).impl,
+      now: () => NOW,
+    });
+    expect((await connectionOf(ahead.db, WS)).lastSyncAt).toBe(NOW);
+
+    // Resumed chain that loses its cursor mid-way: the chain start caps the
+    // anchor, exactly as for a chain that completes.
+    const resumed = await makeDb();
+    const chainStart = NOW - 600000;
+    await resumed.db
+      .update(schema.storeConnections)
+      .set({
+        lastSyncAt: chainStart - 600000,
+        syncCursor: "cursor-from-opening-tick",
+        syncCursorSince: chainStart - 600000 - OVERLAP_MS,
+        syncCursorStartedAt: chainStart,
+      })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+    const page = cursorless(chainStart + 240000);
+    await runSync(resumed.db, resumed.env, WS, { fetchImpl: page.impl, now: () => NOW });
+    expect(page.calls[0].body.variables?.cursor).toBe("cursor-from-opening-tick");
+    const connection = await connectionOf(resumed.db, WS);
+    expect(connection.lastSyncAt).toBe(chainStart);
+    expect(connection.syncCursor).toBeNull();
+    expect(connection.syncCursorSince).toBeNull();
+    expect(connection.syncCursorStartedAt).toBeNull();
+  });
+
+  it("re-scans the window when a persisted cursor carries no chain start", async () => {
+    const { db, env } = await makeDb();
+    const T = Date.parse("2026-09-25T12:00:00.000Z");
+    const previousSync = T - 3600000;
+    const dataset: SimOrder[] = Array.from({ length: 60 }, (_, i) => ({
+      idNum: i + 1,
+      updatedAtMs: T + (i + 1) * 1000,
+    }));
+    // A cursor row written before the chain start was recorded.
+    await db
+      .update(schema.storeConnections)
+      .set({
+        lastSyncAt: previousSync,
+        syncCursor: "idx:50",
+        syncCursorSince: previousSync - OVERLAP_MS,
+        syncCursorStartedAt: null,
+      })
+      .where(eq(schema.storeConnections.workspaceId, WS));
+
+    const sim = shopifySim(dataset);
+    const r1 = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => T + 600000 });
+    expect(r1.added).toBe(10);
+    // Without a known chain start the only safe anchor is the untouched
+    // lastSyncAt: the next tick re-reads the whole window once.
+    const afterResume = await connectionOf(db, WS);
+    expect(afterResume.lastSyncAt).toBe(previousSync);
+    expect(afterResume.syncCursor).toBeNull();
+
+    const r2 = await runSync(db, env, WS, { fetchImpl: sim.impl, now: () => T + 1200000 });
+    expect(r2.added).toBe(50);
+    expect(await ordersIn(db, WS)).toHaveLength(60);
+    expect((await connectionOf(db, WS)).lastSyncAt).toBe(T + 1200000);
+  });
+
   it("recovers when Shopify rejects a persisted cursor", async () => {
     const { db, env } = await makeDb();
     const T = Date.parse("2026-09-25T12:00:00.000Z");
@@ -1016,6 +1435,7 @@ describe("runSync", () => {
     const afterReject = await connectionOf(db, WS);
     expect(afterReject.syncCursor).toBeNull();
     expect(afterReject.syncCursorSince).toBeNull();
+    expect(afterReject.syncCursorStartedAt).toBeNull();
     expect(afterReject.lastError).toContain("cursor");
     expect(afterReject.lastSyncAt).toBe(previousSync);
 
@@ -1043,6 +1463,22 @@ describe("runSync", () => {
     const bound = query.toSQL().params.length;
     expect(bound).toBe(EXISTENCE_CHUNK + 1);
     expect(bound).toBeLessThanOrEqual(100);
+
+    // The claim that precedes each existence read binds the new synced_at,
+    // the workspace, the chunk ids and the guard value.
+    const claim = db
+      .update(schema.orders)
+      .set({ syncedAt: NOW })
+      .where(
+        and(
+          eq(schema.orders.workspaceId, WS),
+          inArray(schema.orders.shopifyOrderId, chunk),
+          lt(schema.orders.syncedAt, NOW),
+        ),
+      );
+    const claimBound = claim.toSQL().params.length;
+    expect(claimBound).toBe(EXISTENCE_CHUNK + 3);
+    expect(claimBound).toBeLessThanOrEqual(100);
   });
 
   it("falls back to status key new when the workspace has no statuses", async () => {
