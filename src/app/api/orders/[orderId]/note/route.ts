@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
+import { broadcast } from "@/server/broadcast";
 import { addOrderNote } from "@/server/desk/mutations";
 import { guardResponse, requireMemberByOrder } from "@/server/guard";
 
@@ -16,9 +18,13 @@ export async function POST(request: Request, context: RouteContext) {
         return NextResponse.json({ error: result.error }, { status: 400 });
       case "not-found":
         return NextResponse.json({ error: "Not found" }, { status: 404 });
-      case "added":
-        // Phase 5 hook point: broadcast this event to the workspace room.
+      case "added": {
+        // After the response: open drawers on this order append the note
+        // (best effort, never fails the request).
+        const { env, ctx } = getCloudflareContext();
+        ctx.waitUntil(broadcast(env, workspaceId, { kind: "order.note", event: result.event }));
         return NextResponse.json({ event: result.event });
+      }
     }
   } catch (e) {
     return guardResponse(e);

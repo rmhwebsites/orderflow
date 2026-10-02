@@ -1,0 +1,82 @@
+// Realtime events: what the server broadcasts to a workspace room and what
+// the desk applies. Shared by the server (src/server/broadcast.ts, bundled
+// into the custom worker for cron, hence relative and type-only imports
+// here) and the client (src/lib/use-live.ts).
+
+import type { EventView } from "../server/desk/shapes";
+
+export type LiveOrderStatus = {
+  id: string;
+  statusKey: string;
+  statusSetBy: string;
+  statusSetAt: number;
+};
+
+export type LiveEvent =
+  // A sync run landed orders: new rows and refreshed snapshots, by order id.
+  | { kind: "orders.synced"; addedOrderIds: string[]; updatedOrderIds: string[] }
+  // A member changed an order's status; event is the timeline entry.
+  | { kind: "order.status"; event: EventView; order: LiveOrderStatus }
+  // A member added a note; event is the timeline entry.
+  | { kind: "order.note"; event: EventView };
+
+const EVENT_TYPES = new Set(["order_new", "status", "note", "po_sent", "po_draft", "sync_error"]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isOrderEvent(value: unknown): value is EventView & { orderId: string } {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.orderId === "string" &&
+    typeof value.type === "string" &&
+    EVENT_TYPES.has(value.type) &&
+    typeof value.text === "string" &&
+    (value.actorId === null || typeof value.actorId === "string") &&
+    typeof value.createdAt === "number"
+  );
+}
+
+function isOrderStatus(value: unknown): value is LiveOrderStatus {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.statusKey === "string" &&
+    typeof value.statusSetBy === "string" &&
+    typeof value.statusSetAt === "number"
+  );
+}
+
+// A socket message as a LiveEvent, or null for anything else (the "pong"
+// heartbeat reply, garbage, a kind this client does not know yet).
+export function parseLiveEvent(raw: string): LiveEvent | null {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!isRecord(data)) {
+    return null;
+  }
+  switch (data.kind) {
+    case "orders.synced":
+      return isStringArray(data.addedOrderIds) && isStringArray(data.updatedOrderIds)
+        ? { kind: "orders.synced", addedOrderIds: data.addedOrderIds, updatedOrderIds: data.updatedOrderIds }
+        : null;
+    case "order.status":
+      return isOrderEvent(data.event) && isOrderStatus(data.order)
+        ? { kind: "order.status", event: data.event, order: data.order }
+        : null;
+    case "order.note":
+      return isOrderEvent(data.event) ? { kind: "order.note", event: data.event } : null;
+    default:
+      return null;
+  }
+}

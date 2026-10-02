@@ -1,6 +1,7 @@
 import { ne } from "drizzle-orm";
 import { getDbFromEnv, type Db } from "../../db";
 import { storeConnections } from "../../db/schema";
+import { broadcastSync } from "../broadcast";
 import { runSync, type SyncOptions } from "./run";
 
 // Sequential on purpose: one shop at a time keeps D1 contention and Shopify
@@ -17,8 +18,9 @@ export async function runAllSyncs(db: Db, env: CloudflareEnv, opts?: SyncOptions
     // One workspace blowing up must not take down the rest of the tick.
     try {
       const result = await runSync(db, env, workspaceId, opts);
-      // Phase 5/6 hook point: broadcast/notify from result.addedOrderIds and
-      // result.updatedOrderIds here.
+      // Open desks refresh from the landed ids (never throws). Phase 6 hook
+      // point: notify from result.addedOrderIds here.
+      await broadcastSync(env, workspaceId, result);
       console.log(
         "[sync] " +
           JSON.stringify({

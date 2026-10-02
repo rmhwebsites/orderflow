@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCloudflareContext } from "@opennextjs/cloudflare";
+import { broadcastSync } from "@/server/broadcast";
 import { getSyncConnection, manualSync, manualSyncResponse } from "@/server/desk/sync";
 import { guardResponse, requireMember } from "@/server/guard";
 
@@ -24,10 +25,13 @@ export async function POST(_request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
     const { db } = await requireMember(id, "member");
-    const { env } = getCloudflareContext();
+    const { env, ctx } = getCloudflareContext();
     const outcome = await manualSync(db, env, id);
-    // Phase 5/6 hook point: broadcast/notify from result.addedOrderIds and
-    // result.updatedOrderIds here.
+    if (outcome.kind !== "cooldown") {
+      // Failed runs too: their id lists still name exactly what landed.
+      // Phase 6 hook point: notify from outcome.result.addedOrderIds here.
+      ctx.waitUntil(broadcastSync(env, id, outcome.result));
+    }
     const reply = manualSyncResponse(outcome);
     return NextResponse.json(reply.body, { status: reply.status, headers: reply.headers });
   } catch (e) {

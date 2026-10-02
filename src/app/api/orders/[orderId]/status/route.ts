@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
+import { broadcast } from "@/server/broadcast";
 import { changeOrderStatus } from "@/server/desk/mutations";
 import { guardResponse, requireMemberByOrder } from "@/server/guard";
 
@@ -20,13 +22,19 @@ export async function POST(request: Request, context: RouteContext) {
         return NextResponse.json({ error: "Not found" }, { status: 404 });
       case "unchanged":
         return NextResponse.json({ unchanged: true });
-      case "changed":
-        // Phase 5 hook point: broadcast this event to the workspace room.
+      case "changed": {
+        // After the response: open desks update the row and any open
+        // drawer's timeline (best effort, never fails the request).
+        const { env, ctx } = getCloudflareContext();
+        ctx.waitUntil(
+          broadcast(env, workspaceId, { kind: "order.status", event: result.event, order: result.order }),
+        );
         return NextResponse.json({
           event: result.event,
           order: result.order,
           triggersPo: result.triggersPo,
         });
+      }
     }
   } catch (e) {
     return guardResponse(e);
