@@ -98,17 +98,26 @@ wherever they conflict. Original: `2026-10-01-order-desk-design.md`.
   them must be a no-op when the state already matches. Every change, from
   either side, lands in the order's activity timeline with its source.
 
-## 5. Email
+## 5. Email (revised Oct 2: client-branded, sent from the client's orders subdomain)
 
 - Default platform sender: `Ordering Desk <orders@orderingdesk.com>`.
-- Per workspace, a platform admin sets the sending address, normally
-  `orders@<client domain>`. That domain must be onboarded under Email
-  Service > Email Sending in Ryan's Cloudflare account (possible only when
-  the client's zone is in that account). Until a test send succeeds, the
-  workspace falls back to the platform sender with the workspace name as the
-  display name and the workspace reply-to.
-- Sign-in emails requested on a client host come from that workspace's
-  sender; sign-in emails on orderingdesk.com come from the platform sender.
+- Workspace emails come from **`accounts@orders.<client domain>`** (IMPACT:
+  `accounts@orders.impactrentals.store`), derived automatically from the
+  workspace's active custom domain, with the workspace name as display name.
+  A platform admin may override the address. Cloudflare treats
+  `orders.<client domain>` as its own sending domain: it must be onboarded
+  under Email Service > Email Sending in Ryan's account (possible only when
+  the client's zone is in that account), then verified with a test send from
+  Settings. Until then, workspace mail falls back to the platform address
+  with the workspace name as display name and the workspace reply-to.
+- Every workspace email is **branded to the client**: logo (PNG copy, since
+  Gmail and Outlook do not show SVG), primary color for the header rule and
+  button (button text picked for contrast), ink and background colors, and
+  font stacks with web-safe fallbacks; one shared layout (renderEmail) used
+  by sign-in on the client host, invites, sender verification, and later
+  notifications and purchase orders. Hub mail keeps the Ordering Desk look.
+- Sign-in emails requested on a client host come from and look like that
+  workspace; sign-in emails on orderingdesk.com use the platform sender.
 
 ## 6. Full per-workspace branding (Ryan, Oct 2)
 
