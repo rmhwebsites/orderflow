@@ -1,5 +1,12 @@
-import { redirect } from "next/navigation";
+import type { Metadata } from "next";
+import { notFound, redirect } from "next/navigation";
 import { AuthError, requireMemberBySlug } from "@/server/guard";
+import { Desk } from "@/components/desk/desk";
+
+// Per-viewer: reads the session.
+export const dynamic = "force-dynamic";
+
+export const metadata: Metadata = { title: "Orders" };
 
 // Every /w/[slug] server component must call requireMemberBySlug itself;
 // layouts are not an auth boundary. The cache() wrapper dedupes the work.
@@ -9,20 +16,18 @@ export default async function WorkspacePage({
   params: Promise<{ slug: string }>;
 }) {
   const { slug } = await params;
-  let workspace: { name: string };
   try {
-    ({ workspace } = await requireMemberBySlug(slug, "member"));
+    await requireMemberBySlug(slug, "member");
   } catch (e) {
     if (e instanceof AuthError) {
-      redirect("/");
+      if (e.status === 401) {
+        redirect("/sign-in");
+      }
+      notFound();
     }
     throw e;
   }
-
-  return (
-    <main className="mx-auto max-w-lg">
-      <h1 className="font-display text-xl font-semibold">{workspace.name}</h1>
-      <p className="mt-2 text-sm opacity-70">Order desk arrives in Phase 5.</p>
-    </main>
-  );
+  // The desk loads its own data client side (skeleton first) and reads the
+  // workspace from the shell's WorkspaceProvider.
+  return <Desk />;
 }
