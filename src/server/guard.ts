@@ -4,15 +4,10 @@ import { headers } from "next/headers";
 import { NextResponse } from "next/server";
 import { getDb, type Db } from "@/db";
 import { orders, workspaceMembers, workspaces } from "@/db/schema";
+import { roleAtLeast, type Role } from "@/lib/roles";
 import { getAuth } from "./auth";
 
-export type Role = "owner" | "admin" | "member";
-
-const RANK: Record<Role, number> = { member: 0, admin: 1, owner: 2 };
-
-export function roleAtLeast(actual: Role, required: Role): boolean {
-  return RANK[actual] >= RANK[required];
-}
+export { roleAtLeast, type Role };
 
 export class AuthError extends Error {
   readonly status: 401 | 404;

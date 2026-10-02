@@ -1,11 +1,20 @@
-import { redirect } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
+import { accentStyle } from "@/lib/accent";
 import { AuthError, requireMemberBySlug } from "@/server/guard";
+import { SyncBanner } from "@/components/shell/sync-banner";
+import { TopBar } from "@/components/shell/top-bar";
+import { WorkspaceProvider } from "@/components/shell/workspace-provider";
+import { ToastProvider } from "@/components/toasts";
 
-// Minimal shell until the full design system lands in Phase 5: a top bar with
-// the workspace accent and name, content below.
+// Per-viewer: reads the session.
+export const dynamic = "force-dynamic";
+
+// The workspace shell: accent scope, providers, top bar, sync banner.
 //
 // Every /w/[slug] server component must call requireMemberBySlug itself;
 // layouts are not an auth boundary. The cache() wrapper dedupes the work.
+// Signed out goes to sign-in; a missing workspace, a non-member and an
+// under-ranked member all get the same 404.
 export default async function WorkspaceLayout({
   children,
   params,
@@ -14,27 +23,41 @@ export default async function WorkspaceLayout({
   params: Promise<{ slug: string }>;
 }) {
   const { slug } = await params;
-  let workspace: { name: string; accentColor: string };
+  let guarded: Awaited<ReturnType<typeof requireMemberBySlug>>;
   try {
-    ({ workspace } = await requireMemberBySlug(slug, "member"));
+    guarded = await requireMemberBySlug(slug, "member");
   } catch (e) {
     if (e instanceof AuthError) {
-      redirect("/");
+      if (e.status === 401) {
+        redirect("/sign-in");
+      }
+      notFound();
     }
     throw e;
   }
+  const { workspace, role, userId } = guarded;
 
   return (
-    <div className="min-h-screen font-sans">
-      <header className="flex items-center gap-3 border-b border-black/10 bg-white px-6 py-3">
-        <span
-          aria-hidden
-          className="h-3 w-3 rounded-full"
-          style={{ backgroundColor: workspace.accentColor }}
-        />
-        <span className="font-display font-semibold">{workspace.name}</span>
-      </header>
-      <div className="px-6 py-8">{children}</div>
+    // The accent scope: the four accent variables come from the workspace's
+    // validated #rrggbb accent (src/lib/accent.ts); globals.css derives the
+    // per-theme strong accent and focus ring from them under this attribute.
+    <div data-accent-scope style={accentStyle(workspace.accentColor)} className="min-h-dvh">
+      <ToastProvider>
+        <WorkspaceProvider
+          workspace={{ id: workspace.id, slug: workspace.slug, name: workspace.name }}
+          role={role}
+          userId={userId}
+        >
+          {/* Made inert while the order drawer is open (it renders into
+              #workspace-overlays, inside the accent scope). */}
+          <div id="workspace-main" className="flex min-h-dvh flex-col">
+            <TopBar name={workspace.name} logoUrl={workspace.logoUrl} />
+            <SyncBanner />
+            <div className="flex-1">{children}</div>
+          </div>
+          <div id="workspace-overlays" />
+        </WorkspaceProvider>
+      </ToastProvider>
     </div>
   );
 }
