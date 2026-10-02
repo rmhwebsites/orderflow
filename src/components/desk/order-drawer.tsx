@@ -21,6 +21,7 @@ import type { OrderSummary } from "@/server/desk/read";
 import type { EventView, StatusView } from "@/server/desk/shapes";
 import { ui } from "@/components/ui";
 import { StatusSelect } from "./status-select";
+import { APP_NAME } from "@/lib/brand";
 
 export type DrawerOrder = {
   id: string;
@@ -225,7 +226,7 @@ function CopyButton({ text, label }: { text: string; label: string }) {
 
 function actorName(event: EventView, members: Map<string, MemberView>, selfUserId: string): string {
   if (!event.actorId) {
-    return event.type === "order_new" ? "Shopify" : "Order Desk";
+    return event.type === "order_new" ? "Shopify" : APP_NAME;
   }
   if (event.actorId === selfUserId) {
     return "You";
@@ -568,7 +569,7 @@ export function OrderDrawerContent({
               {itemsTruncated ? (
                 <p data-tone="amber" className="mb-3 flex gap-2 rounded-panel bg-tone-fill px-3 py-2.5 text-sm text-tone-text">
                   <InfoIcon size={18} aria-hidden className="mt-px shrink-0" />
-                  <span>This order has more items than Order Desk syncs. Open it in Shopify to see all of them.</span>
+                  <span>This order has more items than {APP_NAME} syncs. Open it in Shopify to see all of them.</span>
                 </p>
               ) : null}
               {snapshot.items.length === 0 ? (

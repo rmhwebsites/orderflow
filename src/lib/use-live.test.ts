@@ -23,8 +23,8 @@ describe("reconnectDelay", () => {
 
 describe("liveUrl", () => {
   it("uses wss on https and carries the workspace and ticket", () => {
-    expect(liveUrl({ protocol: "https:", host: "orderflow.example.dev" }, "ws_1", "a.b")).toBe(
-      "wss://orderflow.example.dev/live?workspace=ws_1&ticket=a.b",
+    expect(liveUrl({ protocol: "https:", host: "orderingdesk.example.dev" }, "ws_1", "a.b")).toBe(
+      "wss://orderingdesk.example.dev/live?workspace=ws_1&ticket=a.b",
     );
     expect(liveUrl({ protocol: "http:", host: "localhost:3000" }, "w s", "t")).toBe(
       "ws://localhost:3000/live?workspace=w+s&ticket=t",

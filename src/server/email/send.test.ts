@@ -26,7 +26,7 @@ describe("sendEmail (Cloudflare Email Service driver)", () => {
     });
     expect(email.send).toHaveBeenCalledTimes(1);
     expect(email.send).toHaveBeenCalledWith({
-      from: { name: "Order Desk", email: "orders@impactrentals.store" },
+      from: { name: "Ordering Desk", email: "orders@orderingdesk.com" },
       to: ["a@example.com", "b@example.com"],
       cc: ["c@example.com"],
       replyTo: "support@impactrentals.store",

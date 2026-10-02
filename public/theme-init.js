@@ -4,7 +4,7 @@
 // checks them).
 (function () {
   try {
-    var stored = window.localStorage.getItem("order-desk-theme");
+    var stored = window.localStorage.getItem("ordering-desk-theme");
     if (stored === "dark" || stored === "system") {
       document.documentElement.setAttribute("data-theme", stored);
     }

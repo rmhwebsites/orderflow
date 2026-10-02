@@ -1,5 +1,5 @@
 {
-  "name": "order-desk",
+  "name": "ordering-desk",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -10,8 +10,8 @@
     "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
     "test": "drizzle-kit check && vitest run",
     "db:generate": "drizzle-kit generate",
-    "db:migrate:local": "wrangler d1 migrations apply order_desk --local",
-    "db:migrate:remote": "wrangler d1 migrations apply order_desk --remote",
+    "db:migrate:local": "wrangler d1 migrations apply orderingdesk --local",
+    "db:migrate:remote": "wrangler d1 migrations apply orderingdesk --remote",
     "cf-typegen": "wrangler types --env-interface CloudflareEnv cloudflare-env.d.ts"
   },
   "dependencies": {

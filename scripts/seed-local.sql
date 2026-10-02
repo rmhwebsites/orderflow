@@ -8,7 +8,7 @@
 -- moment you apply the script, so the desk always looks current.
 --
 -- 1. Apply it to the LOCAL database (never add --remote):
---      npx wrangler d1 execute order_desk --local --file scripts/seed-local.sql
+--      npx wrangler d1 execute orderingdesk --local --file scripts/seed-local.sql
 --    Re-running it resets the sample orders, events and statuses; the
 --    workspace row and its members are kept.
 --
@@ -21,7 +21,7 @@
 --
 -- 3. Add yourself to the sample workspace (your user row exists after the
 --    first sign-in; replace the address with the one you signed in with):
---      npx wrangler d1 execute order_desk --local --command "INSERT INTO workspace_members (id, workspace_id, user_id, role) SELECT 'sample-member-' || id, 'sample-ws-example-co', id, 'owner' FROM user WHERE email = 'you@example.com' ON CONFLICT DO NOTHING;"
+--      npx wrangler d1 execute orderingdesk --local --command "INSERT INTO workspace_members (id, workspace_id, user_id, role) SELECT 'sample-member-' || id, 'sample-ws-example-co', id, 'owner' FROM user WHERE email = 'you@example.com' ON CONFLICT DO NOTHING;"
 --
 -- 4. Open http://localhost:3000/w/example-co
 --

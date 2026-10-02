@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 /*
- * Order Desk design tokens.
+ * Ordering Desk design tokens.
  *
  * Bare :root is the LIGHT palette and the default for every workspace.
  * Dark redefines only the color tokens, under :root[data-theme="dark"] and,

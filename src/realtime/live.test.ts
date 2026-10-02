@@ -31,7 +31,7 @@ function fakeEnv() {
 }
 
 function liveRequest(query: string, headers: Record<string, string> = { Upgrade: "websocket" }) {
-  return new Request(`https://orderflow.example.dev${LIVE_PATH}?${query}`, { headers });
+  return new Request(`https://orderingdesk.example.dev${LIVE_PATH}?${query}`, { headers });
 }
 
 describe("handleLiveRequest", () => {

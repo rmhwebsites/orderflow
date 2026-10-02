@@ -13,7 +13,7 @@
 
 export const LIVE_TICKET_TTL_MS = 60000;
 
-const PURPOSE = "order-desk.live-ticket.v1.";
+const PURPOSE = "ordering-desk.live-ticket.v1.";
 const MAX_TICKET_LENGTH = 1024;
 const SEGMENT = /^[A-Za-z0-9_-]+$/;
 

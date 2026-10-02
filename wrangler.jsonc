@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "orderflow",
+  "name": "orderingdesk",
   "main": "custom-worker.ts",
   "compatibility_date": "2026-09-01",
   // global_fetch_strictly_public: lets the Worker fetch its own public hostname
@@ -10,12 +10,12 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "order_desk",
-      "database_id": "2b066c9a-0684-47eb-8672-c638cc6aaa2a",
+      "database_name": "orderingdesk",
+      "database_id": "9d9f35cd-32a4-4f5d-971f-7a9e235c719e",
       "migrations_dir": "drizzle"
     }
   ],
-  "r2_buckets": [{ "binding": "PO_BUCKET", "bucket_name": "orderflow" }],
+  "r2_buckets": [{ "binding": "PO_BUCKET", "bucket_name": "orderingdesk" }],
   // Cloudflare Email Service send binding (requires Workers Paid and an
   // onboarded sending domain before production email works)
   "send_email": [{ "name": "EMAIL" }],
@@ -25,10 +25,14 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceRoom"] }],
   "triggers": { "crons": ["*/10 * * * *"] },
   "observability": { "enabled": true },
+  // The app lives on its custom domain; workers.dev stays off, but preview URLs
+  // stay on so Workers Builds can attach a preview link to branch builds.
+  "routes": [{ "pattern": "orderingdesk.com", "custom_domain": true }],
+  "preview_urls": true,
   // Local development reads APP_URL from .dev.vars instead. EMAIL_FROM's domain
   // must be onboarded under Email Service > Email Sending in this account.
   "vars": {
-    "APP_URL": "https://orderflow.restless-fog-f3c0.workers.dev",
-    "EMAIL_FROM": "Order Desk <orders@impactrentals.store>"
+    "APP_URL": "https://orderingdesk.com",
+    "EMAIL_FROM": "Ordering Desk <orders@orderingdesk.com>"
   }
 }

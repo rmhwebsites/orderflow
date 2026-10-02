@@ -9,7 +9,7 @@ import { APP_NAME } from "../../lib/brand";
 // Default sender for app email until per-workspace senders arrive. The
 // impactrentals.store domain MUST be onboarded in Cloudflare Email Service
 // (Workers Paid) before production email can send from it.
-export const DEFAULT_FROM = `${APP_NAME} <orders@impactrentals.store>`;
+export const DEFAULT_FROM = `${APP_NAME} <orders@orderingdesk.com>`;
 
 // The sender actually used: EMAIL_FROM (wrangler.jsonc vars) when set, else
 // DEFAULT_FROM. Whatever domain it names must be onboarded for Email Sending
