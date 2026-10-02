@@ -1,13 +1,17 @@
 // Tagged Shopify customers as workspace members (platform amendment
 // section 2). The Shopify stage fills shopify_roster from customer webhooks
 // and the periodic sync, and adds or removes source = shopify memberships as
-// tags change. This module holds the shared rules: the tag names and turning
-// roster entries into memberships when the person signs in.
+// tags change (src/server/shopify/roster-sync.ts). This module holds the
+// shared rules: the tag names and turning roster entries into memberships
+// when the person signs in.
+
+// Relative imports on purpose: the cron roster sync
+// (src/server/shopify/roster-sync.ts) bundles this into the custom worker.
 
 import { eq, sql } from "drizzle-orm";
-import type { Db } from "@/db";
-import { applyBatch } from "@/db/batch";
-import { shopifyRoster, workspaceMembers, type RosterTags } from "@/db/schema";
+import type { Db } from "../db";
+import { applyBatch } from "../db/batch";
+import { shopifyRoster, workspaceMembers, type RosterTags } from "../db/schema";
 import { isRecord } from "./desk/shapes";
 
 export const DEFAULT_ROSTER_TAGS: RosterTags = {

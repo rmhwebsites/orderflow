@@ -5,10 +5,12 @@ import type { SyncResult } from "./run";
 
 vi.mock("./run", () => ({ runSync: vi.fn() }));
 vi.mock("../broadcast", () => ({ broadcastSync: vi.fn(async () => undefined) }));
+vi.mock("../shopify/roster-sync", () => ({ syncRoster: vi.fn(async () => ({ kind: "ok", complete: true, entries: 0, removed: 0 })) }));
 
 const { runSync } = await import("./run");
 const { broadcastSync } = await import("../broadcast");
-const { runAllSyncs } = await import("./cron");
+const { syncRoster } = await import("../shopify/roster-sync");
+const { runAllSyncs, WEBHOOK_DELIVERY_RETENTION_MS } = await import("./cron");
 
 const env = { ENCRYPTION_KEY: "unused" } as CloudflareEnv;
 
@@ -33,6 +35,7 @@ async function setup() {
 beforeEach(() => {
   vi.mocked(runSync).mockReset();
   vi.mocked(broadcastSync).mockClear();
+  vi.mocked(syncRoster).mockClear();
   vi.spyOn(console, "log").mockImplementation(() => undefined);
 });
 
@@ -66,5 +69,38 @@ describe("runAllSyncs broadcasting", () => {
     });
     await runAllSyncs(db, env);
     expect(vi.mocked(broadcastSync).mock.calls).toEqual([[env, "ws_b", b]]);
+  });
+});
+
+describe("runAllSyncs roster and housekeeping", () => {
+  // Missed customer webhooks heal here; legacy-token stores (no webhooks)
+  // get their roster only this way.
+  it("reconciles each connected workspace's roster after its order sync", async () => {
+    const db = await setup();
+    vi.mocked(runSync).mockResolvedValue(result());
+    await runAllSyncs(db, env);
+    expect(vi.mocked(syncRoster).mock.calls.map((call) => call[2]).sort()).toEqual(["ws_a", "ws_b"]);
+  });
+
+  it("keeps going when a roster sync throws", async () => {
+    const db = await setup();
+    vi.mocked(runSync).mockResolvedValue(result());
+    vi.mocked(syncRoster).mockRejectedValueOnce(new Error("boom"));
+    await runAllSyncs(db, env);
+    expect(vi.mocked(syncRoster)).toHaveBeenCalledTimes(2);
+  });
+
+  it("prunes webhook deliveries older than the retention window", async () => {
+    const db = await setup();
+    vi.mocked(runSync).mockResolvedValue(result());
+    const now = Date.parse("2026-10-02T12:00:00.000Z");
+    expect(WEBHOOK_DELIVERY_RETENTION_MS).toBe(7 * 24 * 60 * 60 * 1000);
+    await db.insert(schema.webhookDeliveries).values([
+      { id: "ws_a:old", workspaceId: "ws_a", topic: "orders/updated", receivedAt: now - WEBHOOK_DELIVERY_RETENTION_MS - 1 },
+      { id: "ws_a:kept", workspaceId: "ws_a", topic: "orders/updated", receivedAt: now - WEBHOOK_DELIVERY_RETENTION_MS + 1 },
+    ]);
+    await runAllSyncs(db, env, { now: () => now });
+    const left = await db.select().from(schema.webhookDeliveries);
+    expect(left.map((row) => row.id)).toEqual(["ws_a:kept"]);
   });
 });

@@ -486,8 +486,9 @@ async function recordOutcome(
 }
 
 // The innermost error message, unless it is drizzle's "Failed query" text
-// (which lists bound params). Never a payload.
-function safeReason(e: unknown): string {
+// (which lists bound params). Never a payload. Shared with the webhook
+// receiver's logging.
+export function safeErrorReason(e: unknown): string {
   let current = e;
   for (let depth = 0; depth < 10 && current instanceof Error && current.cause instanceof Error; depth++) {
     current = current.cause;
@@ -590,7 +591,7 @@ export async function pushOrderStatus(
       fulfill = false;
     }
   } catch (e) {
-    console.warn("[shopify-push] " + JSON.stringify({ workspaceId, orderId, error: safeReason(e) }));
+    console.warn("[shopify-push] " + JSON.stringify({ workspaceId, orderId, error: safeErrorReason(e) }));
   }
   return recorded;
 }

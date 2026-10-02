@@ -2218,7 +2218,9 @@ describe("runAllSyncs", () => {
 
     expect(await ordersIn(db, "ws_b")).toHaveLength(1);
     expect(await ordersIn(db, "ws_a")).toHaveLength(0);
-    expect(calls).toHaveLength(2);
+    // One orders request per enabled connection (the cron also asks each
+    // store for its tagged customers, which this stub does not serve).
+    expect(calls.filter((call) => String(call.body.query).includes("orders(first:"))).toHaveLength(2);
 
     const joined = logged.join("\n");
     expect(joined).toContain("ws_a");
