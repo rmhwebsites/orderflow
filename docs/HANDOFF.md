@@ -405,3 +405,27 @@ Supersedes the 798 point figure and the old line item limit above.
   SaaS custom hostnames on the orderingdesk.com zone (client CNAME).
 - Stray Worker `order-desk` still exists (shares D1); awaiting Ryan's OK to
   delete.
+
+## STATE UPDATE, 2026-10-02 Cloudflare rename complete (supersedes above)
+
+- Cloudflare resources are all `orderingdesk`: Worker orderingdesk on
+  https://orderingdesk.com (custom domain; workers.dev off, preview URLs on),
+  D1 `orderingdesk` (9d9f35cd-32a4-4f5d-971f-7a9e235c719e), R2 `orderingdesk`.
+  Old D1 order_desk and R2 orderflow were copied (verified by row counts and an
+  identity fingerprint), then DELETED. Final export of the old D1 saved at
+  Impact Rentals/backups/order_desk-final-export-2026-10-02.sql.
+- D1 import gotcha: `wrangler d1 execute --file` of a `d1 export` fails with
+  {"D1_RESET_DO":true} (sqlite_sequence writes, and the bulk import path). What
+  worked: `d1 migrations apply` on the new DB, then the data INSERTs (no
+  d1_migrations or sqlite_sequence rows, parents before children) via
+  `--command`.
+- Production deployed from d162bf0 (rename + Phase 5 part A UI). Email works
+  for orderingdesk.com (onboarded by Ryan). Ryan signed in (account
+  ryan@rmhwebsites.com, workspace "Impact Rentals", role owner). The
+  PLATFORM_ADMIN_EMAILS Worker secret holds ryan@rmhwebsites.com.
+- Phase 5 part A merged (desk, drawer, realtime, theming foundation); its
+  independent review is still owed. Part B was cancelled before it started;
+  its scope moved into the platform phase per
+  docs/plans/2026-10-02-platform-amendment.md.
+- Branch model: develop on build/m1-core; main is the Workers Builds
+  production branch (presumed). Promote reviewed work by fast-forwarding main.
