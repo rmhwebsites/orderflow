@@ -25,6 +25,24 @@ describe("parseLiveEvent", () => {
     expect(parseLiveEvent(JSON.stringify(note))).toEqual(note);
   });
 
+  // Shopify-originated moves have no actor, and Shopify write outcomes reach
+  // an open drawer as order.activity (platform amendment section 4).
+  it("accepts a status change with no actor and an activity entry", () => {
+    const fromShopify = {
+      kind: "order.status",
+      event: { ...event, actorId: null, source: "shopify" },
+      order: { id: "o1", statusKey: "shipped", statusSetBy: null, statusSetAt: 1700000000000 },
+    };
+    const activity = {
+      kind: "order.activity",
+      event: { ...event, type: "shopify_write", actorId: null, text: "Shopify updated: tagged Ordering Desk: Shipped" },
+    };
+    expect(parseLiveEvent(JSON.stringify(fromShopify))).toEqual(fromShopify);
+    expect(parseLiveEvent(JSON.stringify(activity))).toEqual(activity);
+    expect(parseLiveEvent(JSON.stringify({ kind: "order.activity", event: { ...event, type: "bogus" } }))).toBeNull();
+    expect(parseLiveEvent(JSON.stringify({ kind: "order.activity" }))).toBeNull();
+  });
+
   it("returns null for pongs, garbage and unknown kinds", () => {
     for (const raw of ["pong", "", "{", "null", "[]", '{"kind":"order.deleted"}', "42"]) {
       expect(parseLiveEvent(raw)).toBeNull();

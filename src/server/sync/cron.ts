@@ -2,6 +2,7 @@ import { ne } from "drizzle-orm";
 import { getDbFromEnv, type Db } from "../../db";
 import { storeConnections } from "../../db/schema";
 import { broadcastSync } from "../broadcast";
+import { shareShopifyMoves } from "../shopify/fanout";
 import { runSync, type SyncOptions } from "./run";
 
 // Sequential on purpose: one shop at a time keeps D1 contention and Shopify
@@ -21,6 +22,9 @@ export async function runAllSyncs(db: Db, env: CloudflareEnv, opts?: SyncOptions
       // Open desks refresh from the landed ids (never throws). Phase 6 hook
       // point: notify from result.addedOrderIds here.
       await broadcastSync(env, workspaceId, result);
+      // Status moves that came from Shopify: broadcast, and write each
+      // order's status tag back (never throws).
+      await shareShopifyMoves(db, env, workspaceId, result.statusChanges ?? [], opts);
       console.log(
         "[sync] " +
           JSON.stringify({

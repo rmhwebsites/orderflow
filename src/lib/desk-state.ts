@@ -144,6 +144,13 @@ export function applyLiveEvent(
         },
       };
     }
+
+    case "order.activity": {
+      // A system entry (the outcome of writing a status to Shopify): the
+      // open drawer's timeline only, no row change and no flash.
+      const timeline = withTimelineEvent(state.timeline, event.event);
+      return { state: timeline === state.timeline ? state : { ...state, timeline }, effects: NO_EFFECTS };
+    }
   }
 }
 

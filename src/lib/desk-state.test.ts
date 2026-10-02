@@ -192,6 +192,50 @@ describe("applyLiveEvent: order.note", () => {
   });
 });
 
+describe("applyLiveEvent: order.activity", () => {
+  const activity = (id: string, orderId = "o1") => ({
+    kind: "order.activity" as const,
+    event: timelineEvent(id, {
+      orderId,
+      type: "shopify_write",
+      actorId: null,
+      source: "system",
+      text: "Shopify was not updated: Shopify responded with HTTP 503. The status here is kept.",
+      createdAt: 7000,
+    }),
+  });
+
+  it("adds the entry to the open drawer's timeline once, without touching rows or flashing", () => {
+    const opened = state({ timeline: { orderId: "o1", events: [timelineEvent("e1", { createdAt: 3000 })] } });
+    const once = applyLiveEvent(opened, activity("a1"), ME);
+    const twice = applyLiveEvent(once.state, activity("a1"), ME);
+    expect(twice.state.timeline?.events.map((e) => e.id)).toEqual(["a1", "e1"]);
+    expect(once.state.orders).toBe(opened.orders);
+    expect(once.effects).toEqual({ refetch: false, reloadOpenOrder: false, announceOrderIds: [], flashOrderIds: [] });
+  });
+
+  it("is a no-op for another order or a closed drawer", () => {
+    const opened = state({ timeline: { orderId: "o2", events: [] } });
+    expect(applyLiveEvent(opened, activity("a1"), ME).state).toBe(opened);
+    const closed = state();
+    expect(applyLiveEvent(closed, activity("a1"), ME).state).toBe(closed);
+  });
+});
+
+describe("applyLiveEvent: a status change from Shopify", () => {
+  it("moves the row with no actor and flashes it", () => {
+    const fromShopify = statusEvent("o1", "new", "shipped", 4000);
+    const event = {
+      ...fromShopify,
+      event: { ...fromShopify.event, actorId: null, source: "shopify" as const },
+      order: { ...fromShopify.order, statusSetBy: null },
+    };
+    const { state: after, effects } = applyLiveEvent(state(), event, ME);
+    expect(after.orders[0]).toMatchObject({ statusKey: "shipped", statusSetBy: null, statusSetAt: 4000 });
+    expect(effects.flashOrderIds).toEqual(["o1"]);
+  });
+});
+
 describe("optimisticStatus and rollbackStatus", () => {
   it("moves the row and counts at once and reports the previous key", () => {
     const result = optimisticStatus(state(), "o1", "processing");

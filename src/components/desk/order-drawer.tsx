@@ -10,6 +10,7 @@ import { FileTextIcon } from "@phosphor-icons/react/FileText";
 import { InfoIcon } from "@phosphor-icons/react/Info";
 import { PaperPlaneRightIcon } from "@phosphor-icons/react/PaperPlaneRight";
 import { ShoppingBagIcon } from "@phosphor-icons/react/ShoppingBag";
+import { StorefrontIcon } from "@phosphor-icons/react/Storefront";
 import { TagIcon } from "@phosphor-icons/react/Tag";
 import { WarningIcon } from "@phosphor-icons/react/Warning";
 import { XIcon } from "@phosphor-icons/react/X";
@@ -226,7 +227,7 @@ function CopyButton({ text, label }: { text: string; label: string }) {
 
 function actorName(event: EventView, members: Map<string, MemberView>, selfUserId: string): string {
   if (!event.actorId) {
-    return event.type === "order_new" ? "Shopify" : APP_NAME;
+    return event.source === "shopify" || event.type === "order_new" ? "Shopify" : APP_NAME;
   }
   if (event.actorId === selfUserId) {
     return "You";
@@ -245,7 +246,18 @@ const EVENT_ICONS: Record<EventView["type"], typeof ChatTextIcon> = {
   po_draft: FileTextIcon,
   po_sent: FileTextIcon,
   sync_error: WarningIcon,
+  shopify_write: StorefrontIcon,
 };
+
+// A Shopify write that failed reads as a warning, so it stands out.
+function eventIcon(event: EventView): typeof ChatTextIcon {
+  const failed =
+    event.type === "shopify_write" &&
+    typeof event.meta === "object" &&
+    event.meta !== null &&
+    (event.meta as { ok?: unknown }).ok === false;
+  return failed ? WarningIcon : (EVENT_ICONS[event.type] ?? InfoIcon);
+}
 
 function Timeline({
   events,
@@ -292,7 +304,7 @@ function Timeline({
   return (
     <ol className="flex flex-col gap-4">
       {events.map((event) => {
-        const Icon = EVENT_ICONS[event.type] ?? InfoIcon;
+        const Icon = eventIcon(event);
         return (
           <li key={event.id} className="flex gap-3">
             <span className="grid size-8 shrink-0 place-items-center rounded-full bg-surface-2 text-ink-2">

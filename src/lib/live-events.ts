@@ -8,19 +8,32 @@ import type { EventView } from "../server/desk/shapes";
 export type LiveOrderStatus = {
   id: string;
   statusKey: string;
-  statusSetBy: string;
+  // Null for a move that came from Shopify (no person made it).
+  statusSetBy: string | null;
   statusSetAt: number;
 };
 
 export type LiveEvent =
   // A sync run landed orders: new rows and refreshed snapshots, by order id.
   | { kind: "orders.synced"; addedOrderIds: string[]; updatedOrderIds: string[] }
-  // A member changed an order's status; event is the timeline entry.
+  // An order's status changed (a member, or Shopify); event is the timeline
+  // entry.
   | { kind: "order.status"; event: EventView; order: LiveOrderStatus }
   // A member added a note; event is the timeline entry.
-  | { kind: "order.note"; event: EventView };
+  | { kind: "order.note"; event: EventView }
+  // A system timeline entry, such as the outcome of writing a status to
+  // Shopify.
+  | { kind: "order.activity"; event: EventView };
 
-const EVENT_TYPES = new Set(["order_new", "status", "note", "po_sent", "po_draft", "sync_error"]);
+const EVENT_TYPES = new Set([
+  "order_new",
+  "status",
+  "note",
+  "po_sent",
+  "po_draft",
+  "sync_error",
+  "shopify_write",
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -48,7 +61,7 @@ function isOrderStatus(value: unknown): value is LiveOrderStatus {
     isRecord(value) &&
     typeof value.id === "string" &&
     typeof value.statusKey === "string" &&
-    typeof value.statusSetBy === "string" &&
+    (value.statusSetBy === null || typeof value.statusSetBy === "string") &&
     typeof value.statusSetAt === "number"
   );
 }
@@ -76,6 +89,8 @@ export function parseLiveEvent(raw: string): LiveEvent | null {
         : null;
     case "order.note":
       return isOrderEvent(data.event) ? { kind: "order.note", event: data.event } : null;
+    case "order.activity":
+      return isOrderEvent(data.event) ? { kind: "order.activity", event: data.event } : null;
     default:
       return null;
   }

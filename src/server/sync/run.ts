@@ -2,13 +2,21 @@
 // Relative imports on purpose: this module is bundled into the custom worker
 // entrypoint (cron), not only the Next.js build.
 
-import { and, asc, desc, eq, inArray, lt, lte } from "drizzle-orm";
+import { and, desc, eq, inArray, lt, lte } from "drizzle-orm";
 import type { Db } from "../../db";
 import { applyBatch, rowsAffected } from "../../db/batch";
-import { events, orders, statuses, storeConnections } from "../../db/schema";
+import { events, orders, storeConnections } from "../../db/schema";
 import { fetchOrdersUpdatedSince } from "../shopify/client";
 import { accessTokenFor } from "../shopify/token";
-import { normalizeOrders } from "../shopify/normalize";
+import { normalizeOrders, type NormalizedOrder } from "../shopify/normalize";
+import {
+  evaluateShopifyTransitions,
+  initialStatusFor,
+  loadStatusRows,
+  type SnapshotTransition,
+  type StatusChange,
+  type StatusRow,
+} from "../shopify/status-sync";
 
 export type SyncResult = {
   added: number;
@@ -25,6 +33,10 @@ export type SyncResult = {
   // terminal connection state and its lastError/status must not be trusted.
   // added / updated still list exactly the order rows this run landed.
   superseded?: boolean;
+  // Status moves made by the Shopify -> app rules (status-sync.ts) for the
+  // snapshot changes this run landed. Present only when there are any. The
+  // caller broadcasts them and writes the new status tag to Shopify.
+  statusChanges?: StatusChange[];
 };
 
 export type SyncOptions = {
@@ -170,7 +182,7 @@ function parseResumeToken(stored: unknown): { cursor: string; openedAt: number |
     : { cursor: stored, openedAt: null };
 }
 
-type KnownOrder = { id: string; shopify: unknown };
+export type KnownOrder = { id: string; shopify: unknown };
 
 // Claim, then read. orders.synced_at is the start time (now) of the latest
 // run that has looked at the row. Before a run reads stored snapshots to
@@ -185,7 +197,7 @@ type KnownOrder = { id: string; shopify: unknown };
 // blessed by it.
 // One claim UPDATE plus one SELECT per chunk of ids, both inside the D1
 // bound-parameter cap.
-async function claimAndLoad(
+export async function claimAndLoad(
   db: Db,
   workspaceId: string,
   shopifyIds: string[],
@@ -207,6 +219,143 @@ async function claimAndLoad(
   for (const row of rows) {
     into.set(row.shopifyOrderId, { id: row.id, shopify: row.shopify });
   }
+}
+
+export type OrderWriteOutcome =
+  | { kind: "added"; orderId: string }
+  // before: the stored snapshot this write replaced.
+  | { kind: "updated"; orderId: string; before: unknown }
+  | { kind: "none" };
+
+// Writes one fetched order under the claim rule (see claimAndLoad and the
+// fence comment above), the one write path for the sync and for webhooks:
+// - not known: insert it with its initial status (initialStatusFor: its one
+//   status tag, else the status linked to its Shopify state, else the first
+//   status) and its order_new event, both conflict no-ops with a
+//   deterministic event id. If another run stored it first, that row is
+//   claimed, loaded and treated as known.
+// - known with a different snapshot: refresh the snapshot only, guarded on
+//   synced_at so a row claimed by a run that started later is left alone.
+// `known` is the claimed existence map; it is kept current so a duplicate
+// later in the same batch takes the update path. Outcomes are rows-affected
+// truth.
+export async function writeOrderSnapshot(
+  db: Db,
+  workspaceId: string,
+  order: NormalizedOrder,
+  now: number,
+  statusRows: readonly StatusRow[],
+  known: Map<string, KnownOrder>,
+): Promise<OrderWriteOutcome> {
+  let existing = known.get(order.shopifyOrderId);
+
+  if (!existing) {
+    const orderId = crypto.randomUUID();
+    // Both inserts are conflict no-ops and the event id is deterministic
+    // across runs (workspace + Shopify order), so a racing run that lost
+    // inserts nothing and is detected by rows-affected below.
+    const insertOrder = db
+      .insert(orders)
+      .values({
+        id: orderId,
+        workspaceId,
+        shopifyOrderId: order.shopifyOrderId,
+        name: order.name,
+        shopify: order,
+        statusKey: initialStatusFor(order, statusRows, statusRows[0]?.key ?? "new"),
+        createdAt: order.createdAt || now,
+        syncedAt: now,
+      })
+      .onConflictDoNothing();
+    const insertEvent = db
+      .insert(events)
+      .values({
+        id: `evt-order-new-${workspaceId}-${order.shopifyOrderId}`,
+        workspaceId,
+        orderId,
+        type: "order_new",
+        text: `New order ${order.name}${order.customerName ? " from " + order.customerName : ""}`,
+        meta: { orderName: order.name },
+        createdAt: now,
+        source: "shopify",
+      })
+      .onConflictDoNothing();
+    const [orderInsertResult] = await applyPair(db, insertOrder, insertEvent);
+    if (changesOf(orderInsertResult) === 1) {
+      known.set(order.shopifyOrderId, { id: orderId, shopify: order });
+      return { kind: "added", orderId };
+    }
+    // The insert was a conflict no-op: another run stored this order after
+    // our existence read, possibly from an older fetch than ours. Claim
+    // and load that row, then treat it like any other existing order.
+    await claimAndLoad(db, workspaceId, [order.shopifyOrderId], now, known);
+    existing = known.get(order.shopifyOrderId);
+    if (!existing) {
+      return { kind: "none" };
+    }
+  }
+
+  if (JSON.stringify(existing.shopify) === JSON.stringify(order)) {
+    return { kind: "none" };
+  }
+  // Stable diff: normalizeOrders builds keys in one fixed order and JSON
+  // parse/stringify round-trips preserve it, so equal snapshots always
+  // stringify identically.
+  // Refresh the snapshot only. statusKey / statusSetBy / statusSetAt are
+  // the team's own fields and a snapshot write never clobbers them (the
+  // Shopify -> app rules move a status separately, as their own event), and
+  // an updated snapshot gets no new event (order_new is for new orders only).
+  // Guarded on synced_at: the orders table is outside the lease fence, so a
+  // run that outlived its lease may still get here. A row claimed or written
+  // by a run that started later carries a larger synced_at and does not
+  // match; rows-affected says whether the write landed.
+  const snapshotResult = await db
+    .update(orders)
+    .set({ shopify: order, syncedAt: now })
+    .where(and(eq(orders.id, existing.id), lte(orders.syncedAt, now)));
+  if (changesOf(snapshotResult) !== 1) {
+    return { kind: "none" };
+  }
+  known.set(order.shopifyOrderId, { id: existing.id, shopify: order });
+  return { kind: "updated", orderId: existing.id, before: existing.shopify };
+}
+
+// One order outside a sync run (a webhook re-fetched it): claim, load and
+// write it through writeOrderSnapshot, then apply the Shopify -> app status
+// rules to a snapshot change that landed. `now` must be taken before the
+// order was fetched, exactly like a run's now: ownership of the row goes by
+// that start time, so a webhook and a sync run can never write an older
+// snapshot over a newer one, whichever lands last. The webhook takes no
+// sync lease (it would skip or stall behind a run); the lease guards the
+// connection state, and the caller re-checks the connection before calling
+// this, like a run's holdsLease (see src/server/shopify/webhooks.ts).
+export async function upsertFetchedOrder(
+  db: Db,
+  workspaceId: string,
+  order: NormalizedOrder,
+  now: number,
+): Promise<
+  | { kind: "added"; orderId: string; statusChanges: StatusChange[] }
+  | { kind: "updated"; orderId: string; statusChanges: StatusChange[] }
+  | { kind: "unchanged" }
+> {
+  const statusRows = await loadStatusRows(db, workspaceId);
+  const known = new Map<string, KnownOrder>();
+  await claimAndLoad(db, workspaceId, [order.shopifyOrderId], now, known);
+  const outcome = await writeOrderSnapshot(db, workspaceId, order, now, statusRows, known);
+  if (outcome.kind === "added") {
+    return { kind: "added", orderId: outcome.orderId, statusChanges: [] };
+  }
+  if (outcome.kind === "none") {
+    return { kind: "unchanged" };
+  }
+  const statusChanges = await evaluateShopifyTransitions(
+    db,
+    workspaceId,
+    [{ orderId: outcome.orderId, before: outcome.before, after: order }],
+    now,
+  );
+  return { kind: "updated", orderId: outcome.orderId, statusChanges };
 }
 
 export async function runSync(
@@ -401,13 +550,9 @@ export async function runSync(
 
     const normalized = normalizeOrders(fetched.nodes);
 
-    const defaultStatusRows = await db
-      .select({ key: statuses.key })
-      .from(statuses)
-      .where(eq(statuses.workspaceId, workspaceId))
-      .orderBy(asc(statuses.sort))
-      .limit(1);
-    const defaultStatusKey = defaultStatusRows[0]?.key ?? "new";
+    // Every status, in sort order: the first is where a new order starts
+    // unless its tag or Shopify state says otherwise (initialStatusFor).
+    const statusRows = await loadStatusRows(db, workspaceId);
 
     // Existence map in chunks instead of one SELECT per order (each chunk is
     // claimed before it is read, see claimAndLoad); maintained inside the loop
@@ -431,86 +576,40 @@ export async function runSync(
 
     const addedSet = new Set<string>();
     const updatedSet = new Set<string>();
+    // Snapshot changes this run landed, for the Shopify -> app status rules.
+    const transitions: SnapshotTransition[] = [];
 
     for (const order of normalized) {
-      let existing = existingByShopifyId.get(order.shopifyOrderId);
-
-      if (!existing) {
-        const orderId = crypto.randomUUID();
-        // Both inserts are conflict no-ops and the event id is deterministic
-        // across runs (workspace + Shopify order), so a racing run that lost
-        // inserts nothing and is detected by rows-affected below.
-        const insertOrder = db
-          .insert(orders)
-          .values({
-            id: orderId,
-            workspaceId,
-            shopifyOrderId: order.shopifyOrderId,
-            name: order.name,
-            shopify: order,
-            statusKey: defaultStatusKey,
-            createdAt: order.createdAt || now,
-            syncedAt: now,
-          })
-          .onConflictDoNothing();
-        const insertEvent = db
-          .insert(events)
-          .values({
-            id: `evt-order-new-${workspaceId}-${order.shopifyOrderId}`,
-            workspaceId,
-            orderId,
-            type: "order_new",
-            text: `New order ${order.name}${order.customerName ? " from " + order.customerName : ""}`,
-            meta: { orderName: order.name },
-            createdAt: now,
-            source: "shopify",
-          })
-          .onConflictDoNothing();
-        const [orderInsertResult] = await applyPair(db, insertOrder, insertEvent);
-        if (changesOf(orderInsertResult) === 1) {
-          added++;
-          addedOrderIds.push(orderId);
-          addedSet.add(orderId);
-          existingByShopifyId.set(order.shopifyOrderId, { id: orderId, shopify: order });
-          continue;
+      const outcome = await writeOrderSnapshot(db, workspaceId, order, now, statusRows, existingByShopifyId);
+      if (outcome.kind === "added") {
+        added++;
+        addedOrderIds.push(outcome.orderId);
+        addedSet.add(outcome.orderId);
+      } else if (outcome.kind === "updated") {
+        // An id added this run stays out of updatedOrderIds: a later
+        // duplicate in the same payload refines the new order, it does not
+        // "update" it.
+        if (!addedSet.has(outcome.orderId) && !updatedSet.has(outcome.orderId)) {
+          updated++;
+          updatedOrderIds.push(outcome.orderId);
+          updatedSet.add(outcome.orderId);
         }
-        // The insert was a conflict no-op: another run stored this order after
-        // our existence read, possibly from an older fetch than ours. Claim
-        // and load that row, then treat it like any other existing order.
-        await claimAndLoad(db, workspaceId, [order.shopifyOrderId], now, existingByShopifyId);
-        existing = existingByShopifyId.get(order.shopifyOrderId);
-        if (!existing) {
-          continue;
-        }
+        transitions.push({ orderId: outcome.orderId, before: outcome.before, after: order });
       }
+    }
 
-      if (JSON.stringify(existing.shopify) !== JSON.stringify(order)) {
-        // Stable diff: normalizeOrders builds keys in one fixed order and JSON
-        // parse/stringify round-trips preserve it, so equal snapshots always
-        // stringify identically.
-        // Refresh the snapshot only. statusKey / statusSetBy / statusSetAt are
-        // the team's own fields and a sync must never clobber them, and an
-        // updated snapshot gets no new event (order_new is for new orders only).
-        // Guarded on synced_at: the orders table is outside the lease fence,
-        // so a run that outlived its lease may still get here. A row claimed
-        // or written by a run that started later carries a larger synced_at
-        // and does not match; rows-affected says whether the write landed.
-        const snapshotResult = await db
-          .update(orders)
-          .set({ shopify: order, syncedAt: now })
-          .where(and(eq(orders.id, existing.id), lte(orders.syncedAt, now)));
-        if (changesOf(snapshotResult) === 1) {
-          // An id added this run stays out of updatedOrderIds: a later
-          // duplicate in the same payload refines the new order, it does not
-          // "update" it.
-          if (!addedSet.has(existing.id) && !updatedSet.has(existing.id)) {
-            updated++;
-            updatedOrderIds.push(existing.id);
-            updatedSet.add(existing.id);
-          }
-          existingByShopifyId.set(order.shopifyOrderId, { id: existing.id, shopify: order });
-        }
-      }
+    // Shopify -> app status rules for the snapshot changes that landed. They
+    // run even if the lease was lost during the loop: each change landed
+    // exactly once (claim rule), so skipping it here would lose it for good.
+    // A failure here costs only the moves, never the run's progress.
+    let statusChanges: StatusChange[] = [];
+    try {
+      statusChanges = await evaluateShopifyTransitions(db, workspaceId, transitions, now);
+    } catch (e) {
+      console.warn(
+        "[sync] " +
+          JSON.stringify({ workspaceId, statusRules: e instanceof Error ? e.name : "failed" }),
+      );
     }
 
     // When the window this run worked on was opened: this run's own now for
@@ -574,6 +673,7 @@ export async function runSync(
       addedOrderIds,
       updatedOrderIds,
       ...(held ? {} : { superseded: true }),
+      ...(statusChanges.length > 0 ? { statusChanges } : {}),
     };
   } catch (e) {
     // Unexpected throw: release the lease and surface the message; the counts

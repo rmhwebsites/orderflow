@@ -3,12 +3,16 @@ import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { broadcast } from "@/server/broadcast";
 import { changeOrderStatus } from "@/server/desk/mutations";
 import { guardResponse, requireMemberByOrder } from "@/server/guard";
+import { pushAndShare } from "@/server/shopify/fanout";
 
 type RouteContext = { params: Promise<{ orderId: string }> };
 
 // Body {statusKey}. 200 {unchanged: true} when the order already has that
 // status (nothing is written); otherwise 200 {event, order, triggersPo}, where
-// triggersPo tells the client to open the PO review flow.
+// triggersPo tells the client to open the PO review flow. The new status is
+// written to Shopify after the response (status tag, and a fulfillment for a
+// status linked to fulfilled); its outcome lands in the order's timeline and
+// a Shopify failure never undoes the change here.
 export async function POST(request: Request, context: RouteContext) {
   try {
     const { orderId } = await context.params;
@@ -24,10 +28,14 @@ export async function POST(request: Request, context: RouteContext) {
         return NextResponse.json({ unchanged: true });
       case "changed": {
         // After the response: open desks update the row and any open
-        // drawer's timeline (best effort, never fails the request).
+        // drawer's timeline, then the status goes to Shopify and its outcome
+        // follows (best effort, never fails the request).
         const { env, ctx } = getCloudflareContext();
         ctx.waitUntil(
-          broadcast(env, workspaceId, { kind: "order.status", event: result.event, order: result.order }),
+          (async () => {
+            await broadcast(env, workspaceId, { kind: "order.status", event: result.event, order: result.order });
+            await pushAndShare(db, env, workspaceId, orderId);
+          })(),
         );
         return NextResponse.json({
           event: result.event,

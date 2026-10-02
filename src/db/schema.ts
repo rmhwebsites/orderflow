@@ -125,7 +125,12 @@ export const events = sqliteTable("events", {
   id: text("id").primaryKey(),
   workspaceId: text("workspace_id").notNull().references(() => workspaces.id),
   orderId: text("order_id"),
-  type: text("type", { enum: ["order_new", "status", "note", "po_sent", "po_draft", "sync_error"] }).notNull(),
+  // shopify_write: the outcome of writing a status to Shopify (the status
+  // tag, and a fulfillment for a status linked to fulfilled). TypeScript-only
+  // enum: the column has no CHECK, so adding a value needs no migration.
+  type: text("type", {
+    enum: ["order_new", "status", "note", "po_sent", "po_draft", "sync_error", "shopify_write"],
+  }).notNull(),
   text: text("text").notNull(),
   actorId: text("actor_id"),
   meta: text("meta", { mode: "json" }),
