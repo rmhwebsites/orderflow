@@ -339,3 +339,34 @@ Supersedes the 798 point figure and the old line item limit above.
   visible warning. Never prefill a PO from a list whose flag is set.
 - Not deployed yet: the live Worker still runs the old query until the next
   `npm run deploy`. No store is connected, so nothing has synced with it.
+
+## STATE UPDATE, 2026-10-02 later (supersedes the deploy notes above)
+
+- The app now runs on Ryan's Worker `orderflow` (repo-linked Workers Builds
+  project): https://orderflow.restless-fog-f3c0.workers.dev, deployed from
+  6b55356 via a clean worktree. Secrets set on orderflow. wrangler.jsonc name
+  is orderflow. A stray Worker `order-desk` (first smoke deploy) still exists
+  and shares the D1 database; delete it once Ryan confirms.
+- Sign-in email fails in production with "email sending not authorized for
+  subdomain 'impactrentals.store'": no domain is onboarded under Compute >
+  Email Service > Email Sending (no cf-bounce DNS records exist).
+  impactrentals.store DNS is on Cloudflare; inbound mail is Namecheap Private
+  Email (privateemail MX), so onboard Email SENDING only, never Email Routing.
+  Sender is configurable via the EMAIL_FROM var in wrangler.jsonc.
+- Fixed: better-auth rate limits keyed on cf-connecting-ip (were one global
+  bucket per path).
+- NEVER add a "build" field to wrangler.jsonc: `wrangler types` (the prebuild
+  step) runs it, which runs the build again, forever. Happened once on Oct 2.
+- Workers Builds settings Ryan must set (dashboard, orderflow > Settings >
+  Build): build command `npx opennextjs-cloudflare build`, deploy command
+  `npx opennextjs-cloudflare deploy`. Once set and the production branch is
+  known, merge build/m1-core into it so pushes auto-deploy. D1 migrations are
+  NOT applied by Builds: run `npm run db:migrate:remote` before any deploy
+  that adds one (Phase 5 adds a branding column).
+- Phase 4 done (9875186: review repairs incl. one-store-per-workspace 409,
+  read_orders scope check, superseded-sync no-write). 288 tests.
+- Phase 5 running as workflow "phase5-order-screens" (desk, drawer, realtime
+  via signed ticket + custom-worker /live route, settings, branding uploads
+  with SVG sanitizing + PNG copies for email, disconnect-as-disable).
+- A separate user-started session ("Surface orders with more than 50 line
+  items") also commits to this branch; check git log before committing.
