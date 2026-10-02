@@ -557,7 +557,15 @@ const shopBVerified = (async () =>
     JSON.stringify({
       data: {
         shop: { name: "Shop B" },
-        currentAppInstallation: { accessScopes: [{ handle: "read_orders" }] },
+        currentAppInstallation: {
+          accessScopes: [
+            "read_orders",
+            "write_orders",
+            "read_customers",
+            "read_merchant_managed_fulfillment_orders",
+            "write_merchant_managed_fulfillment_orders",
+          ].map((handle) => ({ handle })),
+        },
       },
     }),
     { status: 200 },

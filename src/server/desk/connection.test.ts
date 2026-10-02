@@ -47,7 +47,17 @@ const verifiedBody = (handles: string[]) => ({
   },
 });
 
-const okShop = () => shopFetch(200, verifiedBody(["read_orders", "read_customers"]));
+// Everything the two-way sync needs (platform amendment section 3).
+const FULL_SCOPES = [
+  "read_orders",
+  "write_orders",
+  "read_customers",
+  "read_merchant_managed_fulfillment_orders",
+  "write_merchant_managed_fulfillment_orders",
+];
+const okShop = () => shopFetch(200, verifiedBody(FULL_SCOPES));
+const missingMessage = (missing: string[]) =>
+  `The Shopify app is missing these permissions: ${missing.join(", ")}. Add them to the app's access scopes, approve the new version on the store, and connect again.`;
 
 const STORE_CHANGE_ERROR =
   "This workspace already has orders from another store. Create a new workspace for a different store.";
@@ -170,6 +180,10 @@ describe("saveConnection", () => {
         lastSyncAt: 0,
         lastError: null,
         shopName: "IMPACT Rentals",
+        authMode: "legacy_token",
+        // A legacy token's app secret is unknown, so its webhooks could not
+        // be verified: none are registered and the cron sync carries it.
+        webhooksRegisteredAt: null,
       },
     });
     // The verification call went to the normalized host with the trimmed token.
@@ -271,67 +285,89 @@ describe("saveConnection", () => {
     expect(await connectionRow(db, OTHER)).toBeUndefined();
   });
 
-  it("refuses a token that cannot read orders, and saves nothing", async () => {
+  it("names every missing permission, and saves nothing", async () => {
     const db = await setup();
     await seedConnection(db);
     const before = await connectionRow(db);
-    for (const handles of [["read_products"], [], ["write_orders_typo", "read_customers"]]) {
+    const cases: Array<[string[], string[]]> = [
+      [["read_products"], FULL_SCOPES],
+      [[], FULL_SCOPES],
+      [
+        ["write_orders_typo", "read_customers"],
+        [
+          "read_orders",
+          "write_orders",
+          "read_merchant_managed_fulfillment_orders",
+          "write_merchant_managed_fulfillment_orders",
+        ],
+      ],
+      [["read_orders", "read_customers", "write_merchant_managed_fulfillment_orders"], ["write_orders"]],
+      [
+        ["write_orders", "read_merchant_managed_fulfillment_orders"],
+        ["read_customers", "write_merchant_managed_fulfillment_orders"],
+      ],
+    ];
+    for (const [handles, missing] of cases) {
       const result = await saveConnection(db, ctx(shopFetch(200, verifiedBody(handles)).impl), {
         shopDomain: "impactrentals",
         token: NEW_TOKEN,
       });
-      expect(result, JSON.stringify(handles)).toEqual({
-        kind: "rejected",
-        error:
-          "This token cannot read orders. Give the Shopify app the read_orders permission and try again.",
-      });
+      expect(result, JSON.stringify(handles)).toEqual({ kind: "rejected", error: missingMessage(missing) });
     }
     expect(await connectionRow(db)).toEqual(before);
   });
 
-  // write_orders implies read_orders, and Shopify may list only the write
-  // handle. read_all_orders is optional on top of either.
-  it("accepts write_orders in place of read_orders", async () => {
+  // A write scope implies its read scope, and Shopify may list only the
+  // write handle. read_all_orders is optional on top.
+  it("accepts a write scope in place of its read scope", async () => {
     const db = await setup();
     const result = await saveConnection(
       db,
-      ctx(shopFetch(200, verifiedBody(["write_orders"])).impl),
+      ctx(
+        shopFetch(200, verifiedBody(["write_orders", "write_customers", "write_merchant_managed_fulfillment_orders"]))
+          .impl,
+      ),
       { shopDomain: "impactrentals", token: TOKEN },
     );
     expect(result.kind).toBe("saved");
   });
 
-  it("accepts read_orders or write_orders with read_all_orders alongside", async () => {
-    for (const handles of [["read_orders", "read_all_orders"], ["write_orders", "read_all_orders"]]) {
-      const db = await setup();
-      const result = await saveConnection(db, ctx(shopFetch(200, verifiedBody(handles)).impl), {
-        shopDomain: "impactrentals",
-        token: TOKEN,
-      });
-      expect(result.kind, JSON.stringify(handles)).toBe("saved");
-    }
-  });
-
-  it("does not count read_all_orders alone as order access", async () => {
+  it("accepts the required scopes with read_all_orders alongside", async () => {
     const db = await setup();
     const result = await saveConnection(
       db,
-      ctx(shopFetch(200, verifiedBody(["read_all_orders"])).impl),
+      ctx(shopFetch(200, verifiedBody([...FULL_SCOPES, "read_all_orders"])).impl),
       { shopDomain: "impactrentals", token: TOKEN },
     );
-    expect(result.kind).toBe("rejected");
+    expect(result.kind).toBe("saved");
+  });
+
+  it("does not count read_all_orders as order access", async () => {
+    const db = await setup();
+    const handles = [
+      "read_all_orders",
+      "read_customers",
+      "read_merchant_managed_fulfillment_orders",
+      "write_merchant_managed_fulfillment_orders",
+    ];
+    const result = await saveConnection(db, ctx(shopFetch(200, verifiedBody(handles)).impl), {
+      shopDomain: "impactrentals",
+      token: TOKEN,
+    });
+    expect(result).toEqual({ kind: "rejected", error: missingMessage(["read_orders", "write_orders"]) });
   });
 
   it("records the verified shop name and scopes as a legacy token connection", async () => {
     const db = await setup();
-    await saveConnection(db, ctx(shopFetch(200, verifiedBody(["read_orders", "write_orders"])).impl), {
+    await saveConnection(db, ctx(okShop().impl), {
       shopDomain: "impactrentals",
       token: TOKEN,
     });
     expect(await connectionRow(db)).toMatchObject({
       authMode: "legacy_token",
       shopName: "IMPACT Rentals",
-      scopes: ["read_orders", "write_orders"],
+      scopes: FULL_SCOPES,
+      webhooksRegisteredAt: null,
       clientId: null,
       encryptedClientSecret: null,
       encryptedAccessToken: null,
@@ -380,7 +416,7 @@ describe("saveConnection", () => {
           "INSERT INTO orders (id, workspace_id, shopify_order_id, name, shopify, status_key, created_at, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .run("late", WS, "991", "#991", "{}", "new", 1, 1);
-      return new Response(JSON.stringify(verifiedBody(["read_orders"])), { status: 200 });
+      return new Response(JSON.stringify(verifiedBody(FULL_SCOPES)), { status: 200 });
     }) as typeof fetch;
 
     const result = await saveConnection(db, ctx(orderArrives), {

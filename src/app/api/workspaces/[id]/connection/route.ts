@@ -6,17 +6,23 @@ import { guardResponse, requireMember } from "@/server/guard";
 type RouteContext = { params: Promise<{ id: string }> };
 
 // PLATFORM ADMINS ONLY, both methods (404 for anyone else): this route
-// carries the Shopify access token.
-// Never log the request body or echo the token. Errors thrown by
-// saveConnection are already redacted (no token, no ciphertext, no cause
-// chain), so guardResponse may log them.
+// carries Shopify credentials.
+// Never log the request body or echo a credential. Errors thrown by
+// saveConnection are already redacted (no secret, token or ciphertext, no
+// cause chain), so guardResponse may log them.
 
-// Body {shopDomain, token}. The pair is verified with Shopify before
-// anything is stored. 200 {connection: {shopDomain, status, lastSyncAt,
-// lastError, shopName}}; 400 {error} for a bad domain or token, or no store
-// at the address; 409 {error} when the workspace already has orders and the
-// domain names another store; 422 {error} when Shopify rejects the token or
-// it cannot read orders; 502 {error} when Shopify cannot be reached or errors.
+// Body {shopDomain, clientId, clientSecret} for a Dev Dashboard app (client
+// credentials), or {shopDomain, token} for a legacy Admin API token. The
+// credentials are verified with Shopify before anything is stored; a client
+// credentials save also registers the webhooks. 200 {connection:
+// {shopDomain, status, lastSyncAt, lastError, shopName, authMode,
+// webhooksRegisteredAt}, warning?} where warning says the webhooks could not
+// be registered (the connection is saved and the cron sync runs); 400
+// {error} for bad input or no store at the address; 409 {error} when the
+// workspace already has orders and the domain names another store; 422
+// {error} when Shopify rejects the credentials or a required permission is
+// missing (each one named); 502 {error} when Shopify cannot be reached or
+// errors.
 export async function PUT(request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
@@ -25,7 +31,7 @@ export async function PUT(request: Request, context: RouteContext) {
     const { env } = getCloudflareContext();
     const result = await saveConnection(
       db,
-      { workspaceId: id, encryptionKey: env.ENCRYPTION_KEY },
+      { workspaceId: id, encryptionKey: env.ENCRYPTION_KEY, appUrl: env.APP_URL },
       body,
     );
     switch (result.kind) {
@@ -38,7 +44,10 @@ export async function PUT(request: Request, context: RouteContext) {
       case "unreachable":
         return NextResponse.json({ error: result.error }, { status: 502 });
       case "saved":
-        return NextResponse.json({ connection: result.connection });
+        return NextResponse.json({
+          connection: result.connection,
+          ...(result.warning ? { warning: result.warning } : {}),
+        });
     }
   } catch (e) {
     return guardResponse(e);
