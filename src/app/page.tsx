@@ -6,6 +6,10 @@ import { getAuth } from "@/server/auth";
 import { listWorkspacesForUser } from "@/server/workspaces";
 import { NewWorkspaceForm } from "./new-workspace-form";
 
+// Per-viewer page: never prerender it at build time, where there is no session
+// and getAuth() refuses to run without a deployed APP_URL.
+export const dynamic = "force-dynamic";
+
 export default async function Home() {
   const session = await getAuth().api.getSession({ headers: await headers() });
   if (!session) {

@@ -286,3 +286,25 @@ Known limits, not fixed here (decide before relying on them):
 - Ryan is creating a Shopify custom app token (read orders) for the IMPACT
   store. He enters it himself in workspace settings once that screen exists;
   it must never be pasted into chat or committed.
+
+## STATE UPDATE, 2026-10-02 (supersedes conflicting notes above)
+
+- Sync repair round 2 (658c193) was reviewed once by the main session and
+  accepted: query priced at 798 of Shopify's 1,000 point cap (pinned by a
+  test), truncated runs always resume from Shopify's own cursor, lastSyncAt
+  only moves forward. No further sync hardening loops.
+- DEPLOYED: https://order-desk.restless-fog-f3c0.workers.dev (cron */10 live).
+  Secrets set on the Worker: BETTER_AUTH_SECRET, ENCRYPTION_KEY, CRON_SECRET.
+  APP_URL in wrangler.jsonc now points at that URL. Remote D1 at 0003.
+  Smoke checks passed: signed-out redirect, sign-in page, session endpoint,
+  401 on the API, magic-link validation (no email sent by the agent).
+- Build fix: the home page is force-dynamic. Any future page that reads the
+  session must be dynamic too, or `next build` prerenders it and fails.
+- Pending on Ryan: open the URL, sign in with his email (first real email from
+  orders@impactrentals.store), create the IMPACT Rentals workspace.
+- Next: Phase 4 (desk APIs). One implementer, one review pass; heavy review
+  only for the store-token connection route.
+- Commit trailer is now: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+- Redeploy after code changes: `npm run deploy`. Config-only change:
+  `npx opennextjs-cloudflare deploy`. Apply new migrations remotely first:
+  `npm run db:migrate:remote`.

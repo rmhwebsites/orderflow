@@ -25,7 +25,6 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceRoom"] }],
   "triggers": { "crons": ["*/10 * * * *"] },
   "observability": { "enabled": true },
-  // TODO: replace APP_URL with the real deployed URL after the first `wrangler deploy`;
-  // local development reads APP_URL from .dev.vars instead
-  "vars": { "APP_URL": "https://REPLACE_ME_AFTER_DEPLOY.workers.dev" }
+  // Local development reads APP_URL from .dev.vars instead
+  "vars": { "APP_URL": "https://order-desk.restless-fog-f3c0.workers.dev" }
 }
