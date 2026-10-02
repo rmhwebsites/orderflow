@@ -429,3 +429,36 @@ Supersedes the 798 point figure and the old line item limit above.
   docs/plans/2026-10-02-platform-amendment.md.
 - Branch model: develop on build/m1-core; main is the Workers Builds
   production branch (presumed). Promote reviewed work by fast-forwarding main.
+
+## STATE UPDATE, 2026-10-02 platform phase foundation (supersedes above)
+
+- Branch build/m1-core, commits 217212f (schema + access model) and
+  5c708a4 (Phase 4 review repairs). Not pushed, not deployed.
+- Migration 0004 (drizzle/0004_mute_human_torch.sql) is the one schema
+  migration for the whole platform phase: manager / staff roles with
+  membership source, platform_admins, platform-admin invites, shopify_roster,
+  webhook_deliveries, store connection client-credentials columns,
+  statuses.shopify_link, events.source, workspace custom domain, sender,
+  roster tags and branding JSON (type in src/lib/branding.ts). It converts
+  production rows in place (owner and admin to manager, member to staff,
+  shipped and delivered statuses linked, existing events labeled). The end of
+  the file is hand-written data conversion, and the pending_invites copy was
+  hand-fixed (drizzle-kit selected a column the old table lacks); regenerate
+  nothing over it. Applied locally, NOT remotely.
+- DEPLOY ORDER: `npm run db:migrate:remote` first, then deploy this code
+  right away. Code from before 217212f reads the converted roles as no
+  access (everyone gets 404) until the new code is live. run.test.ts pins
+  that the sync engine needs migration 0004.
+- Access: platform admins (PLATFORM_ADMIN_EMAILS or platform_admins) reach
+  every workspace as role "platform"; requirePlatformAdmin guards workspace
+  creation, /api/platform/admins and the store connection; workspace name
+  and accent color are platform-only. Clients see only their workspaces and
+  land straight in a single one (src/server/hub.ts). Sign-up is closed:
+  sendMagicLink skips sending when the email has no route to an account
+  (same response), and user.create.before refuses the account
+  (src/server/access.ts, src/server/auth.ts). Sign-in claims invites and
+  materializes the Shopify roster (src/server/invites.ts, roster.ts).
+- Local dev: sign-up is closed locally too. Put your address in
+  PLATFORM_ADMIN_EMAILS in .dev.vars (see .dev.vars.example).
+- Settings links stay hidden behind SETTINGS_PAGE_AVAILABLE
+  (src/lib/features.ts) until the settings stage builds the page.
