@@ -172,7 +172,9 @@ that takes longer than the overlap to become searchable is outside what
 this design promises.
 
 Known limits, not fixed here (decide before relying on them):
-- Line items beyond 50 per order are still cut off silently, as before.
+- Line items beyond 49 per order are not fetched, but no longer silently:
+  the order is marked itemsTruncated (see the line item state update at the
+  end of this file).
 - On plans with a small rate bucket, Shopify's throttle (not MAX_PAGES) is
   expected to end a backlog run early, by a rough estimate after a hundred
   orders or so; a 60 day first sync of a busy shop then drains over several
@@ -308,3 +310,32 @@ Known limits, not fixed here (decide before relying on them):
 - Redeploy after code changes: `npm run deploy`. Config-only change:
   `npx opennextjs-cloudflare deploy`. Apply new migrations remotely first:
   `npm run db:migrate:remote`.
+
+## STATE UPDATE, 2026-10-02, line item truncation marker (962766f)
+
+Supersedes the 798 point figure and the old line item limit above.
+
+- The orders query asks for lineItems(first: 49) with pageInfo { hasNextPage }
+  and prices at 788 points by the client.test.ts estimator (budget 800). The
+  marker costs one object per order; with 50 slots it would price at 803,
+  which is why the cap went from 50 to 49. The live cost check under round 2,
+  item 2 still applies, with 788 as the expected figure.
+- Every stored orders.shopify snapshot carries itemsTruncated. It is false
+  only when Shopify said the order has no line items beyond `items`; a
+  missing or malformed answer counts as truncated. Consumers must read it as
+  `snapshot.itemsTruncated !== false`, so a snapshot stored before this
+  change (no key) also counts as unconfirmed. No migration: the column is
+  untyped JSON.
+- The sync does not fetch the remaining line items. A follow-up request in
+  the page loop would need its own throttle handling: on a small rate bucket
+  a page of large orders can throttle the follow-up on every tick, and ending
+  the run there would pin the cursor chain to that page.
+- Phase 5 (desk): when the flag is set, say the order has more line items in
+  Shopify than shown.
+- Phase 7 (PO modal), required: when the flag is set, fetch that one order's
+  full line item list on demand before prefilling (order(id:) with
+  lineItems(first: 250, after:) paged, about 754 points per request by the
+  same estimator), and if that fetch fails, block "Send to vendor" with a
+  visible warning. Never prefill a PO from a list whose flag is set.
+- Not deployed yet: the live Worker still runs the old query until the next
+  `npm run deploy`. No store is connected, so nothing has synced with it.
