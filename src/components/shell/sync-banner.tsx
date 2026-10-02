@@ -28,7 +28,7 @@ export function SyncBanner() {
   if (!detail) {
     return null;
   }
-  const severe = !failure && chip.kind === "ready" && chip.tone === "bad";
+  const severe = chip.kind === "ready" && chip.tone === "bad";
 
   return (
     <div data-tone={severe ? "red" : "amber"} className="border-b border-line bg-tone-fill" role="status">

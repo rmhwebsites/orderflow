@@ -29,7 +29,7 @@ export function DeskSkeleton() {
         {ROWS.map((row) => (
           <div
             key={row}
-            className="grid grid-cols-[6.5rem_7.5rem_22%_1fr_8rem_10.5rem] items-start border-t border-line py-3.5"
+            className="grid grid-cols-[6.5rem_7.5rem_22%_1fr_8rem_11.5rem] items-start border-t border-line py-3.5"
           >
             <div className="px-4">
               <Bar className="h-4 w-14" />

@@ -243,44 +243,61 @@
   --tone-text: var(--st-pink-text);
 }
 
-html {
-  background: var(--bg);
+/* Element defaults live in the base layer so utilities (focus:outline-none,
+   placeholder:*) can still override them. */
+@layer base {
+  html {
+    background: var(--bg);
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--accent) 40%, transparent);
+    color: var(--ink);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
+
+  ::placeholder {
+    color: var(--ink-3);
+    opacity: 1;
+  }
+
+  /* Native select lists follow the theme instead of a chip's tone. */
+  select option {
+    background-color: var(--surface);
+    color: var(--ink);
+  }
 }
 
-body {
-  background: var(--bg);
-  color: var(--ink);
-  font-family: var(--font-sans);
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  text-rendering: optimizeLegibility;
-}
+@layer components {
+  /* Shadows tinted to the page hue, never pure black. */
+  .shadow-panel {
+    box-shadow:
+      0 1px 2px hsl(var(--shadow-tint) / 0.06),
+      0 8px 24px -12px hsl(var(--shadow-tint) / 0.18);
+  }
+  .shadow-lift {
+    box-shadow:
+      0 2px 6px hsl(var(--shadow-tint) / 0.1),
+      0 24px 48px -16px hsl(var(--shadow-tint) / 0.32);
+  }
 
-::selection {
-  background: color-mix(in srgb, var(--accent) 40%, transparent);
-  color: var(--ink);
-}
-
-:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 2px;
-}
-
-::placeholder {
-  color: var(--ink-3);
-  opacity: 1;
-}
-
-/* Shadows tinted to the page hue, never pure black. */
-.shadow-panel {
-  box-shadow:
-    0 1px 2px hsl(var(--shadow-tint) / 0.06),
-    0 8px 24px -12px hsl(var(--shadow-tint) / 0.18);
-}
-.shadow-lift {
-  box-shadow:
-    0 2px 6px hsl(var(--shadow-tint) / 0.1),
-    0 24px 48px -16px hsl(var(--shadow-tint) / 0.32);
+  .od-skeleton {
+    background: var(--surface-2);
+    border-radius: 9999px;
+  }
 }
 
 /*
@@ -315,11 +332,6 @@ body {
   to {
     transform: rotate(360deg);
   }
-}
-
-.od-skeleton {
-  background: var(--surface-2);
-  border-radius: 9999px;
 }
 
 /* Live-change flash: an accent wash over a row cell or card that fades. */

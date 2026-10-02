@@ -6,8 +6,8 @@ import type { StatusView } from "@/server/desk/shapes";
 // The inline status control: a native select (keyboard, screen reader and
 // phone pickers for free) dressed as the status chip, so it always shows
 // the status's text label in its semantic color. An order whose key has no
-// status row any more shows "Unknown status (<key>)" in slate and can be
-// moved to any real status.
+// status row any more shows "Unknown: <key>" in slate and can be moved to
+// any real status.
 export function StatusSelect({
   statuses,
   value,
@@ -28,7 +28,8 @@ export function StatusSelect({
   return (
     <span data-tone={current?.color ?? "slate"} className="relative inline-flex max-w-full">
       <select
-        aria-label={label}
+        aria-label={current ? label : `${label}. Unknown status ${value}`}
+        title={current ? undefined : `Unknown status: ${value}. Choose a status to move this order.`}
         value={value}
         disabled={disabled}
         onChange={(event) => onChange(event.target.value)}
@@ -37,7 +38,7 @@ export function StatusSelect({
       >
         {current ? null : (
           <option value={value} disabled>
-            Unknown status ({value})
+            Unknown: {value}
           </option>
         )}
         {statuses.map((status) => (

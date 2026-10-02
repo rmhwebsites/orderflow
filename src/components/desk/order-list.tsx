@@ -60,7 +60,7 @@ export function OrderTable({ orders, statuses, flashing, rowErrors, onOpen, onCh
           <col className="w-[22%]" />
           <col />
           <col className="w-[8rem]" />
-          <col className="w-[10.5rem]" />
+          <col className="w-[11.5rem]" />
         </colgroup>
         <thead>
           <tr className="text-xs font-semibold text-ink-2">
