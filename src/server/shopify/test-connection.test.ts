@@ -26,21 +26,48 @@ function detailOf(result: Awaited<ReturnType<typeof testShopConnection>>): strin
   return "detail" in result ? result.detail : "";
 }
 
+const verified = (handles: string[]) =>
+  json({
+    data: {
+      shop: { name: "IMPACT Rentals" },
+      currentAppInstallation: { accessScopes: handles.map((handle) => ({ handle })) },
+    },
+  });
+
 describe("testShopConnection", () => {
-  it("returns the shop name from a { shop { name } } query sent with the usual protections", async () => {
-    const { impl, calls } = stub(() => json({ data: { shop: { name: "IMPACT Rentals" } } }));
+  it("returns the shop name and the token's scopes, sent with the usual protections", async () => {
+    const { impl, calls } = stub(() => verified(["read_orders", "read_customers"]));
     const result = await testShopConnection(DOMAIN, TOKEN, impl);
 
-    expect(result).toEqual({ kind: "ok", shopName: "IMPACT Rentals" });
+    expect(result).toEqual({
+      kind: "ok",
+      shopName: "IMPACT Rentals",
+      accessScopes: ["read_orders", "read_customers"],
+    });
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe(`https://${DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`);
     expect(calls[0].init.method).toBe("POST");
     const headers = calls[0].init.headers as Record<string, string>;
     expect(headers["X-Shopify-Access-Token"]).toBe(TOKEN);
     expect(headers["content-type"]).toBe("application/json");
-    expect(String(calls[0].body.query).replace(/\s+/g, " ").trim()).toBe("{ shop { name } }");
     expect(calls[0].init.redirect).toBe("manual");
     expect(calls[0].init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  // Two objects and a short list: no connection, no page size, nothing for
+  // Shopify's cost limit to multiply, and no variables to inject into.
+  it("stays a small fixed query", async () => {
+    const { impl, calls } = stub(() => verified(["read_orders"]));
+    await testShopConnection(DOMAIN, TOKEN, impl);
+    const query = String(calls[0].body.query).replace(/\s+/g, " ").trim();
+    expect(query).toBe("{ shop { name } currentAppInstallation { accessScopes { handle } } }");
+    expect(query).not.toMatch(/\b(first|last|after|before)\s*:/);
+    expect(calls[0].body.variables).toBeUndefined();
+  });
+
+  it("reports a missing store (HTTP 404) as no-store", async () => {
+    const { impl } = stub(() => json({ errors: "Not Found" }, 404));
+    expect(await testShopConnection(DOMAIN, TOKEN, impl)).toEqual({ kind: "no-store" });
   });
 
   it("classifies 401 and 403 as auth", async () => {
@@ -51,7 +78,7 @@ describe("testShopConnection", () => {
   });
 
   it("classifies 429, 5xx and other non-2xx answers as transient, naming the status", async () => {
-    for (const status of [429, 500, 503, 302, 404]) {
+    for (const status of [429, 500, 503, 302, 400]) {
       const { impl } = stub(() => json({}, status));
       const result = await testShopConnection(DOMAIN, TOKEN, impl);
       expect(result.kind, String(status)).toBe("transient");
@@ -89,13 +116,20 @@ describe("testShopConnection", () => {
     });
   });
 
-  it("treats invalid JSON or a body without a shop name as transient", async () => {
+  it("treats invalid JSON or a body without a shop name or scope list as transient", async () => {
+    const scopes = { accessScopes: [{ handle: "read_orders" }] };
     const bodies = [
       () => new Response("<html>bad gateway</html>", { status: 200 }),
       () => json({}),
       () => json({ data: {} }),
-      () => json({ data: { shop: null } }),
-      () => json({ data: { shop: { name: 7 } } }),
+      () => json({ data: { shop: null, currentAppInstallation: scopes } }),
+      () => json({ data: { shop: { name: 7 }, currentAppInstallation: scopes } }),
+      () => json({ data: { shop: { name: "IMPACT Rentals" } } }),
+      () => json({ data: { shop: { name: "IMPACT Rentals" }, currentAppInstallation: null } }),
+      () =>
+        json({
+          data: { shop: { name: "IMPACT Rentals" }, currentAppInstallation: { accessScopes: "read_orders" } },
+        }),
     ];
     for (const body of bodies) {
       const { impl } = stub(body);

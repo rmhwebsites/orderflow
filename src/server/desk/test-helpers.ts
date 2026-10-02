@@ -33,6 +33,30 @@ export function openTestDb() {
   return { db, raw };
 }
 
+// Adds a D1-style batch to the better-sqlite3 Db so the atomic path of
+// applyBatch runs; every batch call is recorded (its statements, in order).
+export function withBatch(db: Db, record: unknown[][]): Db {
+  const batch = async (statements: PromiseLike<unknown>[]) => {
+    record.push([...statements]);
+    const out: unknown[] = [];
+    for (const statement of statements) {
+      out.push(await statement);
+    }
+    return out;
+  };
+  return new Proxy(db as object, {
+    get(target, prop) {
+      if (prop === "batch") {
+        return batch;
+      }
+      const value = Reflect.get(target, prop);
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  }) as unknown as Db;
+}
+
 export const TEST_STATUSES = [
   { key: "new", label: "New", color: "lime", triggersPo: false },
   { key: "processing", label: "Processing", color: "blue", triggersPo: false },

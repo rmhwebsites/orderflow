@@ -162,9 +162,14 @@ export async function replaceStatuses(
   const taken = new Set(existingKeys);
   const statements: PromiseLike<unknown>[] = [];
   if (removedKeys.length > 0) {
-    // Guarded in SQL as well: an order assigned to one of these statuses
-    // after the check above keeps its status instead of being orphaned (that
-    // status then simply stays in the list).
+    // Guarded in SQL as well: a status that some order uses at the moment
+    // this delete runs is kept, so the delete itself never orphans an order.
+    // That covers orders already assigned when the batch runs. A status
+    // change that read the status before this delete and writes after it is
+    // covered on its own side (changeOrderStatus re-checks in SQL that the
+    // status exists). The sync engine is not covered: an order synced between
+    // runSync reading the default status and this delete can still carry a
+    // removed key, which the desk has to show as an unknown status.
     statements.push(
       db.delete(statuses).where(
         and(
@@ -178,6 +183,25 @@ export async function replaceStatuses(
           ),
         ),
       ),
+    );
+    // A status the guard kept moves after every listed status, in its old
+    // relative order. Left at its old sort it could tie with the new sort 0
+    // and become the default for synced orders. Deleted rows match nothing.
+    // Parameters: three per removed key plus the workspace id, so at most 61
+    // for 20 statuses, inside D1's 100.
+    const survivorSort = sql.join(
+      [
+        sql`case ${statuses.key}`,
+        ...removedKeys.map((key, i) => sql`when ${key} then ${entries.length + i}`),
+        sql`else ${statuses.sort} end`,
+      ],
+      sql` `,
+    );
+    statements.push(
+      db
+        .update(statuses)
+        .set({ sort: survivorSort })
+        .where(and(eq(statuses.workspaceId, workspaceId), inArray(statuses.key, removedKeys))),
     );
   }
   entries.forEach((entry, sort) => {

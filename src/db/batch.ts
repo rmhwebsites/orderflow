@@ -32,3 +32,28 @@ export async function applyBatch(
   }
   return results;
 }
+
+// Rows affected by a write, across drivers: D1 reports meta.changes, the
+// better-sqlite3 test driver reports changes at the top level. An unknown
+// shape counts as 1 and is logged under the caller's label: a double-run is
+// idempotent, a never-run is an outage.
+export function rowsAffected(result: unknown, label: string): number {
+  if (typeof result === "object" && result !== null) {
+    const direct = (result as { changes?: unknown }).changes;
+    if (typeof direct === "number") {
+      return direct;
+    }
+    const meta = (result as { meta?: { changes?: unknown } }).meta;
+    if (meta && typeof meta.changes === "number") {
+      return meta.changes;
+    }
+  }
+  let shape = "unserializable";
+  try {
+    shape = JSON.stringify(result) ?? String(result);
+  } catch {
+    // keep the fallback label
+  }
+  console.warn(`[${label}] unknown write result shape, assuming one row affected: ` + shape);
+  return 1;
+}

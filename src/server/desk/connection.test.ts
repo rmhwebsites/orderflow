@@ -40,7 +40,17 @@ function shopFetch(status: number, body: unknown) {
   return { impl, calls };
 }
 
-const okShop = () => shopFetch(200, { data: { shop: { name: "IMPACT Rentals" } } });
+const verifiedBody = (handles: string[]) => ({
+  data: {
+    shop: { name: "IMPACT Rentals" },
+    currentAppInstallation: { accessScopes: handles.map((handle) => ({ handle })) },
+  },
+});
+
+const okShop = () => shopFetch(200, verifiedBody(["read_orders", "read_customers"]));
+
+const STORE_CHANGE_ERROR =
+  "This workspace already has orders from another store. Create a new workspace for a different store.";
 
 async function connectionRow(db: Db, workspaceId = WS) {
   const rows = await db
@@ -151,12 +161,14 @@ describe("saveConnection", () => {
       token: `  ${TOKEN} `,
     });
 
+    // The same connection shape as GET /sync, plus the verified shop name.
     expect(result).toEqual({
       kind: "saved",
       connection: {
         shopDomain: "impactrentals.myshopify.com",
         status: "ok",
         lastSyncAt: 0,
+        lastError: null,
         shopName: "IMPACT Rentals",
       },
     });
@@ -181,9 +193,11 @@ describe("saveConnection", () => {
     await expect(decryptSecret(row.encryptedToken, KEY)).rejects.toThrow();
   });
 
-  it("resets the sync state and the lease when the shop domain changes", async () => {
+  it("resets the sync state and the lease when the shop domain changes before any order exists", async () => {
     const db = await setup();
     await seedConnection(db);
+    // Another workspace's orders do not count.
+    await seedOrder(db, OTHER, { id: "x1" });
     const result = await saveConnection(db, ctx(okShop().impl), {
       shopDomain: "impact-two",
       token: NEW_TOKEN,
@@ -206,9 +220,10 @@ describe("saveConnection", () => {
     expect(await decryptSecret(row.encryptedToken, KEY, WS)).toBe(NEW_TOKEN);
   });
 
-  it("keeps lastSyncAt and the cursor when only the token changes", async () => {
+  it("keeps lastSyncAt and the cursor when only the token changes, orders or not", async () => {
     const db = await setup();
     await seedConnection(db);
+    await seedOrder(db, WS, { id: "o1" });
     const result = await saveConnection(db, ctx(okShop().impl), {
       shopDomain: "impactrentals.myshopify.com",
       token: NEW_TOKEN,
@@ -242,7 +257,7 @@ describe("saveConnection", () => {
         shopDomain: "impact-two",
         token: NEW_TOKEN,
       });
-      expect(result).toEqual({ kind: "rejected" });
+      expect(result).toEqual({ kind: "rejected", error: "Shopify rejected this token" });
     }
     expect(await connectionRow(db)).toEqual(before);
 
@@ -252,8 +267,88 @@ describe("saveConnection", () => {
       { workspaceId: OTHER, encryptionKey: KEY, fetchImpl: shopFetch(401, {}).impl },
       { shopDomain: "other-shop", token: NEW_TOKEN },
     );
-    expect(fresh).toEqual({ kind: "rejected" });
+    expect(fresh).toEqual({ kind: "rejected", error: "Shopify rejected this token" });
     expect(await connectionRow(db, OTHER)).toBeUndefined();
+  });
+
+  it("refuses a token that cannot read orders, and saves nothing", async () => {
+    const db = await setup();
+    await seedConnection(db);
+    const before = await connectionRow(db);
+    for (const handles of [["read_products"], [], ["write_orders_typo", "read_customers"]]) {
+      const result = await saveConnection(db, ctx(shopFetch(200, verifiedBody(handles)).impl), {
+        shopDomain: "impactrentals",
+        token: NEW_TOKEN,
+      });
+      expect(result, JSON.stringify(handles)).toEqual({
+        kind: "rejected",
+        error:
+          "This token cannot read orders. Give the Shopify app the read_orders permission and try again.",
+      });
+    }
+    expect(await connectionRow(db)).toEqual(before);
+  });
+
+  it("accepts read_all_orders in place of read_orders", async () => {
+    const db = await setup();
+    const result = await saveConnection(
+      db,
+      ctx(shopFetch(200, verifiedBody(["read_all_orders"])).impl),
+      { shopDomain: "impactrentals", token: TOKEN },
+    );
+    expect(result.kind).toBe("saved");
+  });
+
+  it("answers a Shopify 404 as no store at this address, and saves nothing", async () => {
+    const db = await setup();
+    const result = await saveConnection(db, ctx(shopFetch(404, { errors: "Not Found" }).impl), {
+      shopDomain: "no-such-store",
+      token: TOKEN,
+    });
+    expect(result).toEqual({ kind: "invalid", error: "No Shopify store at this address" });
+    expect(await connectionRow(db)).toBeUndefined();
+  });
+
+  // A workspace is one business with one store.
+  it("refuses to move a workspace with orders to another store, before contacting Shopify", async () => {
+    const db = await setup();
+    await seedConnection(db);
+    await seedOrder(db, WS, { id: "o1" });
+    const before = await connectionRow(db);
+    const shop = okShop();
+
+    const result = await saveConnection(db, ctx(shop.impl), {
+      shopDomain: "impact-two",
+      token: NEW_TOKEN,
+    });
+    expect(result).toEqual({ kind: "store-change", error: STORE_CHANGE_ERROR });
+    expect(shop.calls).toHaveLength(0);
+    expect(await connectionRow(db)).toEqual(before);
+  });
+
+  // The early refusal above is a read; the decision that counts is inside
+  // the upsert, so an order that lands while the token is being verified
+  // still blocks the change.
+  it("refuses inside the upsert when the first order lands during verification", async () => {
+    const { db, raw } = openTestDb();
+    await seedWorkspace(db, WS);
+    await seedConnection(db);
+    const before = await connectionRow(db);
+    const orderArrives = (async () => {
+      raw
+        .prepare(
+          "INSERT INTO orders (id, workspace_id, shopify_order_id, name, shopify, status_key, created_at, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run("late", WS, "991", "#991", "{}", "new", 1, 1);
+      return new Response(JSON.stringify(verifiedBody(["read_orders"])), { status: 200 });
+    }) as typeof fetch;
+
+    const result = await saveConnection(db, ctx(orderArrives), {
+      shopDomain: "impact-two",
+      token: NEW_TOKEN,
+    });
+    expect(result).toEqual({ kind: "store-change", error: STORE_CHANGE_ERROR });
+    expect(await connectionRow(db)).toEqual(before);
   });
 
   it("saves nothing when Shopify cannot be reached or answers with an error", async () => {

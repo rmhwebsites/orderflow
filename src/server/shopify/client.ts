@@ -277,8 +277,11 @@ export function isValidShopDomain(domain: string): boolean {
 }
 
 export type ShopConnectionResult =
-  | { kind: "ok"; shopName: string }
+  // accessScopes: the handles of the scopes granted to the token's app.
+  | { kind: "ok"; shopName: string; accessScopes: string[] }
   | { kind: "auth" }
+  // HTTP 404: no store answers at this myshopify.com address.
+  | { kind: "no-store" }
   | { kind: "transient"; detail: string }
   | { kind: "fatal"; detail: string };
 
@@ -286,13 +289,17 @@ export type ShopConnectionResult =
 // shorter budget than the sync's page requests.
 const CONNECTION_TEST_TIMEOUT_MS = 15000;
 
-const SHOP_NAME_QUERY = "{ shop { name } }";
+// Two objects and a short list (not a connection): nothing for the cost
+// limit to multiply, and no variables.
+const CONNECTION_TEST_QUERY =
+  "{ shop { name } currentAppInstallation { accessScopes { handle } } }";
 
-// Verifies a domain and token pair with the cheapest possible query before
-// the token is stored. Same protections as fetchOrdersUpdatedSince: the host
-// is checked against the allowlist before any request, redirects are never
-// followed (they would re-send the token), the request has a timeout, and no
-// detail string ever contains the token. Never throws.
+// Verifies a domain and token pair with a small fixed query before the token
+// is stored, returning the shop name and the token's scopes. Same
+// protections as fetchOrdersUpdatedSince: the host is checked against the
+// allowlist before any request, redirects are never followed (they would
+// re-send the token), the request has a timeout, and no detail string ever
+// contains the token. Never throws.
 export async function testShopConnection(
   shopDomain: string,
   token: string,
@@ -312,7 +319,7 @@ export async function testShopConnection(
           "X-Shopify-Access-Token": token,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ query: SHOP_NAME_QUERY }),
+        body: JSON.stringify({ query: CONNECTION_TEST_QUERY }),
         redirect: "manual",
         signal: AbortSignal.timeout(CONNECTION_TEST_TIMEOUT_MS),
       },
@@ -328,6 +335,9 @@ export async function testShopConnection(
 
   if (response.status === 401 || response.status === 403) {
     return { kind: "auth" };
+  }
+  if (response.status === 404) {
+    return { kind: "no-store" };
   }
   if (response.status < 200 || response.status >= 300) {
     return { kind: "transient", detail: `Shopify responded with HTTP ${response.status}` };
@@ -351,11 +361,21 @@ export async function testShopConnection(
     return { kind: "fatal", detail: scrub(message, token) };
   }
 
-  const shop = isRecord(body) && isRecord(body.data) ? body.data.shop : undefined;
-  if (!isRecord(shop) || typeof shop.name !== "string") {
+  const data = isRecord(body) && isRecord(body.data) ? body.data : undefined;
+  const shop = data?.shop;
+  const installation = data?.currentAppInstallation;
+  if (
+    !isRecord(shop) ||
+    typeof shop.name !== "string" ||
+    !isRecord(installation) ||
+    !Array.isArray(installation.accessScopes)
+  ) {
     return { kind: "transient", detail: "unexpected response shape" };
   }
+  const accessScopes = installation.accessScopes
+    .map((scope) => (isRecord(scope) && typeof scope.handle === "string" ? scope.handle : null))
+    .filter((handle): handle is string => handle !== null);
   // The name goes back to the browser; scrubbed like every other string
   // that originated outside this worker.
-  return { kind: "ok", shopName: scrub(shop.name, token) };
+  return { kind: "ok", shopName: scrub(shop.name, token), accessScopes };
 }

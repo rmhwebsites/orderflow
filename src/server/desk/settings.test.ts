@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import type { Db } from "@/db";
 import * as schema from "@/db/schema";
 import { getWorkspaceSettings, updateWorkspaceSettings } from "./settings";
-import { openTestDb, seedWorkspace } from "./test-helpers";
+import { openTestDb, seedWorkspace, withBatch } from "./test-helpers";
 
 const WS = "ws_impact";
 const OTHER = "ws_other";
@@ -28,29 +28,6 @@ async function updated(db: Db, body: Record<string, unknown>) {
     throw new Error("expected ok, got " + JSON.stringify(result));
   }
   return result;
-}
-
-// Adds a D1-style batch to the better-sqlite3 Db so the atomic path runs.
-function withBatch(db: Db, record: unknown[][]): Db {
-  const batch = async (statements: PromiseLike<unknown>[]) => {
-    record.push([...statements]);
-    const out: unknown[] = [];
-    for (const statement of statements) {
-      out.push(await statement);
-    }
-    return out;
-  };
-  return new Proxy(db as object, {
-    get(target, prop) {
-      if (prop === "batch") {
-        return batch;
-      }
-      const value = Reflect.get(target, prop);
-      return typeof value === "function"
-        ? (value as (...args: unknown[]) => unknown).bind(target)
-        : value;
-    },
-  }) as unknown as Db;
 }
 
 describe("getWorkspaceSettings", () => {

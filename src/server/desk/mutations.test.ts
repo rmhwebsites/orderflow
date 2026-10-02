@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import type { Db } from "@/db";
 import * as schema from "@/db/schema";
 import { NOTE_MAX, addOrderNote, changeOrderStatus } from "./mutations";
-import { openTestDb, seedOrder, seedWorkspace, snapshotOf } from "./test-helpers";
+import { openTestDb, seedOrder, seedWorkspace, snapshotOf, withBatch } from "./test-helpers";
 
 const WS = "ws_impact";
 const OTHER = "ws_other";
@@ -35,29 +35,6 @@ async function orderRow(db: Db, id: string) {
 
 function eventsOf(db: Db, workspaceId = WS) {
   return db.select().from(schema.events).where(eq(schema.events.workspaceId, workspaceId));
-}
-
-// Adds a D1-style batch to the better-sqlite3 Db so the atomic path runs.
-function withBatch(db: Db, record: unknown[][]): Db {
-  const batch = async (statements: PromiseLike<unknown>[]) => {
-    record.push([...statements]);
-    const out: unknown[] = [];
-    for (const statement of statements) {
-      out.push(await statement);
-    }
-    return out;
-  };
-  return new Proxy(db as object, {
-    get(target, prop) {
-      if (prop === "batch") {
-        return batch;
-      }
-      const value = Reflect.get(target, prop);
-      return typeof value === "function"
-        ? (value as (...args: unknown[]) => unknown).bind(target)
-        : value;
-    },
-  }) as unknown as Db;
 }
 
 describe("changeOrderStatus", () => {
@@ -163,6 +140,39 @@ describe("changeOrderStatus", () => {
     expect(after.name).toBe(before.name);
     expect(after.createdAt).toBe(before.createdAt);
     expect(after.shopifyOrderId).toBe(before.shopifyOrderId);
+  });
+
+  // replaceStatuses can delete the status after this function checked it
+  // and before its write lands; the order must not end up on a deleted key,
+  // with or without the atomic batch path.
+  it("does not land on a status removed between its check and its write", async () => {
+    for (const batched of [false, true]) {
+      const { db, raw } = openTestDb();
+      await seedWorkspace(db, WS);
+      await seedOrder(db, WS, { id: "o1", statusKey: "new" });
+      const removing = new Proxy(db as object, {
+        get(target, prop) {
+          const value = Reflect.get(target, prop);
+          if (prop === "update") {
+            return (...args: unknown[]) => {
+              raw.prepare("DELETE FROM statuses WHERE workspace_id = ? AND key = ?").run(WS, "shipped");
+              return (value as (...a: unknown[]) => unknown).apply(target, args);
+            };
+          }
+          return typeof value === "function"
+            ? (value as (...a: unknown[]) => unknown).bind(target)
+            : value;
+        },
+      }) as unknown as Db;
+      const before = await orderRow(db, "o1");
+
+      const result = await changeOrderStatus(batched ? withBatch(removing, []) : removing, ctx(), {
+        statusKey: "shipped",
+      });
+      expect(result.kind, `batched: ${batched}`).toBe("invalid");
+      expect(await orderRow(db, "o1")).toEqual(before);
+      expect(await eventsOf(db)).toEqual([]);
+    }
   });
 
   it("is not-found for an order in another workspace, and writes nothing there", async () => {

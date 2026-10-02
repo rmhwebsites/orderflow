@@ -37,11 +37,21 @@ export type OrderSummary = {
   fulfillmentStatus: string;
   itemCount: number;
   itemsPreview: string[];
+  // Every non-empty item title, so a desk search covers items past the
+  // preview.
+  itemTitles: string[];
   // True unless the sync confirmed the stored line items are the whole order
-  // (see itemsTruncated in normalize.ts). When true, itemCount and the
-  // preview cover only the items the sync fetched.
+  // (see itemsTruncated in normalize.ts). When true, itemCount, the preview
+  // and itemTitles cover only the items the sync fetched.
   itemsTruncated: boolean;
 };
+
+// Only an explicit false counts as complete; a snapshot stored before the
+// marker existed has no key and stays unconfirmed. One rule for the list
+// and the order detail.
+function itemsTruncatedOf(snapshot: unknown): boolean {
+  return !isRecord(snapshot) || snapshot.itemsTruncated !== false;
+}
 
 export type DeskPayload = {
   workspace: { id: string; name: string; slug: string; accentColor: string };
@@ -87,9 +97,8 @@ function summarize(row: typeof orders.$inferSelect): OrderSummary {
     itemsPreview: items
       .slice(0, PREVIEW_ITEMS)
       .map((item) => `${quantity(item)} x ${text(item.title) || "Untitled item"}`),
-    // Only an explicit false counts as complete; a snapshot stored before the
-    // marker existed has no key and stays unconfirmed.
-    itemsTruncated: snapshot.itemsTruncated !== false,
+    itemTitles: items.map((item) => text(item.title)).filter((title) => title.length > 0),
+    itemsTruncated: itemsTruncatedOf(row.shopify),
   };
 }
 
@@ -161,13 +170,26 @@ export async function loadDesk(
   };
 }
 
-export async function getOrderDetail(db: Db, workspaceId: string, orderId: string) {
+export type OrderDetail = {
+  // The whole row, including the full stored snapshot.
+  order: typeof orders.$inferSelect;
+  // Computed from the snapshot with the list's rule, so the drawer does not
+  // re-implement it.
+  itemsTruncated: boolean;
+};
+
+export async function getOrderDetail(
+  db: Db,
+  workspaceId: string,
+  orderId: string,
+): Promise<OrderDetail | null> {
   const rows = await db
     .select()
     .from(orders)
     .where(and(eq(orders.id, orderId), eq(orders.workspaceId, workspaceId)))
     .limit(1);
-  return rows[0] ?? null;
+  const order = rows[0];
+  return order ? { order, itemsTruncated: itemsTruncatedOf(order.shopify) } : null;
 }
 
 export type EventsResult = { kind: "ok"; events: EventView[] } | { kind: "not-found" };

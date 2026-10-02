@@ -3,7 +3,7 @@ import { asc, eq } from "drizzle-orm";
 import type { Db } from "@/db";
 import * as schema from "@/db/schema";
 import { STATUS_COLORS, STATUS_LIST_MAX, replaceStatuses } from "./statuses";
-import { openTestDb, seedOrder, seedWorkspace } from "./test-helpers";
+import { openTestDb, seedOrder, seedWorkspace, withBatch } from "./test-helpers";
 
 const WS = "ws_impact";
 const OTHER = "ws_other";
@@ -21,6 +21,30 @@ function statusRows(db: Db, workspaceId = WS) {
     .from(schema.statuses)
     .where(eq(schema.statuses.workspaceId, workspaceId))
     .orderBy(asc(schema.statuses.sort), asc(schema.statuses.key));
+}
+
+// Proxy that assigns an order to statusKey the moment the delete statement
+// is built, i.e. after replaceStatuses' in-use check and before its batch
+// runs.
+function assignDuringDelete(db: Db, raw: ReturnType<typeof openTestDb>["raw"], statusKey: string): Db {
+  return new Proxy(db as object, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop);
+      if (prop === "delete") {
+        return (...args: unknown[]) => {
+          raw
+            .prepare(
+              "INSERT INTO orders (id, workspace_id, shopify_order_id, name, shopify, status_key, created_at, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .run("late", WS, "777", "#777", "{}", statusKey, 1, 1);
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      return typeof value === "function"
+        ? (value as (...a: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  }) as unknown as Db;
 }
 
 const entry = (label: string, extra: Record<string, unknown> = {}) => ({
@@ -163,34 +187,50 @@ describe("replaceStatuses", () => {
   // status in between must not be orphaned: that delete is guarded in SQL.
   it("keeps a status that gains an order between the check and the write", async () => {
     const { db, raw } = await setup();
-    const racing = new Proxy(db as object, {
-      get(target, prop) {
-        const value = Reflect.get(target, prop);
-        if (prop === "delete") {
-          return (...args: unknown[]) => {
-            raw
-              .prepare(
-                "INSERT INTO orders (id, workspace_id, shopify_order_id, name, shopify, status_key, created_at, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-              )
-              .run("late", WS, "777", "#777", "{}", "shipped", 1, 1);
-            return (value as (...a: unknown[]) => unknown).apply(target, args);
-          };
-        }
-        return typeof value === "function"
-          ? (value as (...a: unknown[]) => unknown).bind(target)
-          : value;
-      },
-    }) as unknown as Db;
-
-    const result = await replaceStatuses(racing, WS, [
+    const result = await replaceStatuses(assignDuringDelete(db, raw, "shipped"), WS, [
       { key: "new", label: "New", color: "lime", triggersPo: false },
     ]);
     expect(result.kind).toBe("ok");
     const keys = (await statusRows(db)).map((row) => row.key);
-    expect(keys).toContain("new");
-    expect(keys).toContain("shipped");
-    expect(keys).not.toContain("processing");
-    expect(keys).not.toContain("approved");
+    expect(keys).toEqual(["new", "shipped"]);
+  });
+
+  // Left at its old sort, a survivor could tie with the new sort 0 and so
+  // become the default status for synced orders.
+  it("moves a status the guard kept to the end of the list", async () => {
+    const { db, raw } = await setup();
+    // Remove "new" (the default, sort 0) and "shipped"; an order is assigned
+    // to "new" between the check and the write.
+    const result = await replaceStatuses(assignDuringDelete(db, raw, "new"), WS, [
+      { key: "processing", label: "Processing", color: "blue", triggersPo: false },
+      { key: "approved", label: "Approved", color: "green", triggersPo: true },
+    ]);
+    expect(result.kind).toBe("ok");
+    expect((await statusRows(db)).map((row) => [row.key, row.sort])).toEqual([
+      ["processing", 0],
+      ["approved", 1],
+      ["new", 2],
+    ]);
+  });
+
+  it("sends every write through one batch", async () => {
+    const { db, raw } = await setup();
+    const batched: unknown[][] = [];
+    const result = await replaceStatuses(withBatch(assignDuringDelete(db, raw, "shipped"), batched), WS, [
+      { key: "new", label: "New", color: "lime", triggersPo: false },
+      { key: "approved", label: "Approved", color: "green", triggersPo: true },
+      entry("Brand new"),
+    ]);
+    expect(result.kind).toBe("ok");
+    expect(batched).toHaveLength(1);
+    // The guarded delete, the survivor re-sort, two updates and one insert.
+    expect(batched[0]).toHaveLength(5);
+    expect((await statusRows(db)).map((row) => row.key)).toEqual([
+      "new",
+      "approved",
+      "brand_new",
+      "shipped",
+    ]);
   });
 
   it("allows exactly the nine design token colors, green included", async () => {

@@ -69,12 +69,16 @@ export async function requireMember(workspaceId: string, required: Role) {
   return { userId, role, db, session };
 }
 
-// Guard for order-scoped routes (/api/orders/[orderId]/...): resolves the
-// order's workspace, then applies the membership rule above. A missing order
-// and a non-member (or under-ranked) caller get the same 404, so order ids
-// reveal nothing to outsiders. 401 without a session comes first.
-export async function requireMemberByOrder(orderId: string, required: Role) {
-  const { userId, db, session } = await requireSession();
+// The db-taking core of requireMemberByOrder: resolves the order's
+// workspace, then applies the membership rule above. A missing order and a
+// non-member (or under-ranked) caller get the same 404, so order ids reveal
+// nothing to outsiders.
+export async function resolveOrderAccess(
+  db: Db,
+  orderId: string,
+  userId: string,
+  required: Role,
+): Promise<{ role: Role; workspaceId: string }> {
   const rows = await db
     .select({ workspaceId: orders.workspaceId })
     .from(orders)
@@ -85,7 +89,15 @@ export async function requireMemberByOrder(orderId: string, required: Role) {
     throw new AuthError(404, "Not found");
   }
   const role = await memberRole(db, order.workspaceId, userId, required);
-  return { userId, role, db, session, workspaceId: order.workspaceId };
+  return { role, workspaceId: order.workspaceId };
+}
+
+// Guard for order-scoped routes (/api/orders/[orderId]/...): 401 without a
+// session first, then resolveOrderAccess.
+export async function requireMemberByOrder(orderId: string, required: Role) {
+  const { userId, db, session } = await requireSession();
+  const { role, workspaceId } = await resolveOrderAccess(db, orderId, userId, required);
+  return { userId, role, db, session, workspaceId };
 }
 
 // Guard for /w/[slug] server components. EVERY server component under

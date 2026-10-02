@@ -112,6 +112,8 @@ describe("loadDesk", () => {
         fulfillmentStatus: "unfulfilled",
         itemCount: 10,
         itemsPreview: ["3 x Hard Hat", "2 x Safety Vest", "1 x Caster Wheel"],
+        // Every title, so a desk search covers items past the preview.
+        itemTitles: ["Hard Hat", "Safety Vest", "Caster Wheel", "Ladder"],
         itemsTruncated: false,
       },
     ]);
@@ -155,14 +157,17 @@ describe("loadDesk", () => {
       total: "",
       itemCount: 0,
       itemsPreview: [],
+      itemTitles: [],
     });
     // A quantity that is not a finite number counts as 1, as in the
-    // normalizer; an empty title gets a readable placeholder.
+    // normalizer; an empty title gets a readable placeholder in the preview
+    // and is left out of the searchable titles.
     expect(oddSnapshot).toMatchObject({
       id: "o_odd",
       total: "",
       itemCount: 2,
       itemsPreview: ["1 x Untitled item", "1 x Rope"],
+      itemTitles: ["Rope"],
     });
   });
 
@@ -259,19 +264,34 @@ describe("getOrderDetail", () => {
     });
     await seedOrder(db, WS, { id: "o1", shopify, createdAt: 10, syncedAt: 20 });
 
-    const order = await getOrderDetail(db, WS, "o1");
-    expect(order).toEqual({
-      id: "o1",
-      workspaceId: WS,
-      shopifyOrderId: "shop-o1",
-      name: "#o1",
-      shopify,
-      statusKey: "new",
-      statusSetBy: null,
-      statusSetAt: null,
-      createdAt: 10,
-      syncedAt: 20,
+    const detail = await getOrderDetail(db, WS, "o1");
+    expect(detail).toEqual({
+      order: {
+        id: "o1",
+        workspaceId: WS,
+        shopifyOrderId: "shop-o1",
+        name: "#o1",
+        shopify,
+        statusKey: "new",
+        statusSetBy: null,
+        statusSetAt: null,
+        createdAt: 10,
+        syncedAt: 20,
+      },
+      itemsTruncated: false,
     });
+  });
+
+  it("computes itemsTruncated with the same rule as the list: anything but false is truncated", async () => {
+    const db = await setup();
+    const legacy = snapshotOf();
+    delete legacy.itemsTruncated;
+    await seedOrder(db, WS, { id: "partial", shopify: snapshotOf({ itemsTruncated: true }) });
+    await seedOrder(db, WS, { id: "legacy", shopify: legacy });
+    await seedOrder(db, WS, { id: "odd", shopify: ["not", "a", "snapshot"] });
+    for (const id of ["partial", "legacy", "odd"]) {
+      expect((await getOrderDetail(db, WS, id))?.itemsTruncated, id).toBe(true);
+    }
   });
 
   it("returns null for an order that belongs to another workspace", async () => {

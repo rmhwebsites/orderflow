@@ -6,7 +6,7 @@
 
 import { eq, sql } from "drizzle-orm";
 import type { Db } from "@/db";
-import { storeConnections } from "@/db/schema";
+import { orders, storeConnections } from "@/db/schema";
 import { encryptSecret } from "@/server/crypto";
 import { isValidShopDomain, testShopConnection } from "@/server/shopify/client";
 import { isRecord } from "./shapes";
@@ -70,16 +70,30 @@ export type ConnectionView = {
   shopDomain: string;
   status: "ok";
   lastSyncAt: number;
+  // Same shape as the connection in GET /api/workspaces/[id]/sync; always
+  // null right after a save.
+  lastError: string | null;
   shopName: string;
 };
 
 export type SaveConnectionResult =
+  // Bad input, or no Shopify store at the address (400).
   | { kind: "invalid"; error: string }
-  // Shopify answered 401/403 to the verification query.
-  | { kind: "rejected" }
-  // Shopify could not be reached or answered with an error.
+  // Shopify refused the token, or the token cannot read orders (422).
+  | { kind: "rejected"; error: string }
+  // The workspace already has orders and the domain names another store (409).
+  | { kind: "store-change"; error: string }
+  // Shopify could not be reached or answered with an error (502).
   | { kind: "unreachable"; error: string }
   | { kind: "saved"; connection: ConnectionView };
+
+const TOKEN_REJECTED = "Shopify rejected this token";
+const CANNOT_READ_ORDERS =
+  "This token cannot read orders. Give the Shopify app the read_orders permission and try again.";
+const STORE_CHANGE_REFUSED =
+  "This workspace already has orders from another store. Create a new workspace for a different store.";
+// read_all_orders reaches past the 60 day window and implies read_orders.
+const ORDER_SCOPES = ["read_orders", "read_all_orders"];
 
 export type ConnectionContext = {
   workspaceId: string;
@@ -111,20 +125,51 @@ function failureReason(e: unknown): string {
     : "unexpected database error";
 }
 
+// Whether the workspace's stored connection names a different shop while
+// the workspace already has orders: the one change saveConnection refuses.
+async function storeChangeBlocked(db: Db, workspaceId: string, shopDomain: string) {
+  const rows = await db
+    .select({ shopDomain: storeConnections.shopDomain })
+    .from(storeConnections)
+    .where(eq(storeConnections.workspaceId, workspaceId))
+    .limit(1);
+  if (!rows[0] || rows[0].shopDomain === shopDomain) {
+    return false;
+  }
+  const anyOrder = await db
+    .select({ id: orders.id })
+    .from(orders)
+    .where(eq(orders.workspaceId, workspaceId))
+    .limit(1);
+  return anyOrder.length > 0;
+}
+
 // Verifies the pair with Shopify, then upserts the connection. Nothing is
-// written unless Shopify accepted the token.
+// written unless Shopify accepted the token and it can read orders.
+//
+// A workspace is one business with one store: once it has orders, a save
+// that names another shop is refused and nothing changes. A changed domain
+// on a workspace with no orders, or a new token for the same domain, is
+// saved.
 //
 // On save the connection is marked ok with no last error. A new row, or a
 // row whose shop domain changed, also starts over: lastSyncAt 0 and no sync
 // cursor, so the next sync opens a fresh first-sync window for that store. A
 // token-only change keeps lastSyncAt and any cursor. Either way the sync
-// lease is released (runningUntil 0): a run still holding it started under
-// the old credentials, and its fenced terminal write must not overwrite what
-// is saved here (see fencedConnectionWrite in src/server/sync/run.ts).
+// lease is released (runningUntil 0). What that buys: a run still holding
+// the lease started under the old settings, so its fenced connection writes
+// (lastSyncAt, cursor, status) match nothing from here on, and it re-checks
+// the lease after its fetch, between existence chunks and before its write
+// loop, returning superseded without writing orders once it sees the change.
+// What it does not buy: a run already inside its write loop finishes that
+// loop (see the fence comment in src/server/sync/run.ts).
 //
-// One statement: the "did the shop change" decision happens inside the
-// upsert, against the row as it is at write time, so a concurrent save or
-// delete cannot slip between a read and the write.
+// One statement decides: whether the shop changed, and whether the
+// workspace has orders, are both evaluated inside the upsert against the
+// tables as they are at write time (the setWhere below), so no concurrent
+// save, delete or first synced order can slip between a read and the write.
+// storeChangeBlocked runs first only to refuse early, without sending the
+// token to Shopify for a change that would be refused anyway.
 export async function saveConnection(
   db: Db,
   ctx: ConnectionContext,
@@ -143,19 +188,30 @@ export async function saveConnection(
     };
   }
 
+  if (await storeChangeBlocked(db, ctx.workspaceId, shopDomain)) {
+    return { kind: "store-change", error: STORE_CHANGE_REFUSED };
+  }
+
   const check = await testShopConnection(shopDomain, token, ctx.fetchImpl ?? fetch);
   if (check.kind === "auth") {
-    return { kind: "rejected" };
+    return { kind: "rejected", error: TOKEN_REJECTED };
+  }
+  if (check.kind === "no-store") {
+    return { kind: "invalid", error: "No Shopify store at this address" };
   }
   if (check.kind !== "ok") {
     // check.detail is token-free by testShopConnection's contract.
     return { kind: "unreachable", error: `Could not verify the connection: ${check.detail}` };
+  }
+  if (!check.accessScopes.some((scope) => ORDER_SCOPES.includes(scope))) {
+    return { kind: "rejected", error: CANNOT_READ_ORDERS };
   }
 
   let encryptedToken: string | undefined;
   try {
     encryptedToken = await encryptSecret(token, ctx.encryptionKey, ctx.workspaceId);
     const sameShop = sql`${storeConnections.shopDomain} = excluded.shop_domain`;
+    const noOrders = sql`not exists (select 1 from ${orders} where ${orders.workspaceId} = ${ctx.workspaceId})`;
     const rows = await db
       .insert(storeConnections)
       .values({
@@ -182,14 +238,24 @@ export async function saveConnection(
           syncCursor: sql`case when ${sameShop} then ${storeConnections.syncCursor} else null end`,
           syncCursorSince: sql`case when ${sameShop} then ${storeConnections.syncCursorSince} else null end`,
         },
+        // An existing row is only updated for the same shop, or for another
+        // shop while the workspace has no orders. Otherwise the update is
+        // skipped and RETURNING yields no row. (A new row is always inserted:
+        // with no stored connection there is no other store to protect.)
+        setWhere: sql`${sameShop} or ${noOrders}`,
       })
-      .returning({ lastSyncAt: storeConnections.lastSyncAt });
+      .returning({ lastSyncAt: storeConnections.lastSyncAt, lastError: storeConnections.lastError });
+    const saved = rows[0];
+    if (!saved) {
+      return { kind: "store-change", error: STORE_CHANGE_REFUSED };
+    }
     return {
       kind: "saved",
       connection: {
         shopDomain,
         status: "ok",
-        lastSyncAt: rows[0]?.lastSyncAt ?? 0,
+        lastSyncAt: saved.lastSyncAt,
+        lastError: saved.lastError,
         shopName: check.shopName,
       },
     };

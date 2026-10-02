@@ -3,9 +3,9 @@
 // Callers authorize first (requireMemberByOrder); every query here is still
 // scoped to the workspace it is given.
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@/db";
-import { applyBatch } from "@/db/batch";
+import { applyBatch, rowsAffected } from "@/db/batch";
 import { events, orders, statuses } from "@/db/schema";
 import { eventView, isRecord, type EventView } from "./shapes";
 
@@ -90,13 +90,30 @@ export async function changeOrderStatus(
     meta: { from: order.statusKey, to: statusKey },
     createdAt: now,
   };
-  await applyBatch(db, [
+  // The status was read above, but replaceStatuses may remove it before
+  // this write lands. Both statements therefore re-check in SQL that it
+  // still exists: the update only matches while it does, and the event is
+  // an insert-select that yields its one row only while it does. On D1 the
+  // batch is one transaction, so the two agree; rows-affected of the update
+  // tells which way it went.
+  const statusStillExists = sql`exists (select 1 from ${statuses} where ${statuses.workspaceId} = ${ctx.workspaceId} and ${statuses.key} = ${statusKey})`;
+  const [updateResult] = await applyBatch(db, [
     db
       .update(orders)
       .set({ statusKey, statusSetBy: ctx.userId, statusSetAt: now })
-      .where(and(eq(orders.id, order.id), eq(orders.workspaceId, ctx.workspaceId))),
-    db.insert(events).values(event),
+      .where(
+        and(eq(orders.id, order.id), eq(orders.workspaceId, ctx.workspaceId), statusStillExists),
+      ),
+    // Values in the events table's column order.
+    db
+      .insert(events)
+      .select(
+        sql`select ${event.id}, ${event.workspaceId}, ${event.orderId}, ${event.type}, ${event.text}, ${event.actorId}, ${JSON.stringify(event.meta)}, ${event.createdAt} where ${statusStillExists}`,
+      ),
   ]);
+  if (rowsAffected(updateResult, "desk") === 0) {
+    return { kind: "invalid", error: "Unknown status for this workspace" };
+  }
 
   return {
     kind: "changed",

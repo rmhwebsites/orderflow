@@ -12,6 +12,7 @@ import { MAX_PAGES, ORDERS_PER_PAGE } from "../shopify/client";
 import fixture from "../shopify/__fixtures__/orders-graphql.json";
 import { runSync, applyPair, EXISTENCE_CHUNK, type SyncResult } from "./run";
 import { runAllSyncs } from "./cron";
+import { deleteConnection, saveConnection } from "../desk/connection";
 
 // runSync against a real migrated SQLite database. @cloudflare/vitest-pool-workers
 // peer-requires vitest 4 and this repo is on vitest 5, so the D1 in these tests
@@ -529,6 +530,120 @@ function withHookAfterExistenceRead(db: Db, hook: () => Promise<void>): Db {
   }) as unknown as Db;
 }
 
+// A fetch that parks until release() is called, so a test can act while a
+// run sits inside its Shopify request holding the lease. atFetch resolves
+// once the run is parked there.
+function heldFetch(nodes: unknown[]) {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let entered!: () => void;
+  const atFetch = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const page = pageFetch(nodes);
+  const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    entered();
+    await gate;
+    return page.impl(input, init);
+  }) as typeof fetch;
+  return { impl, atFetch, release };
+}
+
+// Answers the connection-settings verification query for a second store.
+const shopBVerified = (async () =>
+  new Response(
+    JSON.stringify({
+      data: {
+        shop: { name: "Shop B" },
+        currentAppInstallation: { accessScopes: [{ handle: "read_orders" }] },
+      },
+    }),
+    { status: 200 },
+  )) as typeof fetch;
+
+function storeOrders(count: number, firstId: number) {
+  return Array.from({ length: count }, (_, i) => ({
+    ...rileyNode,
+    id: `gid://shopify/Order/${firstId + i}`,
+    legacyResourceId: String(firstId + i),
+    name: `#${firstId + i}`,
+  }));
+}
+
+// Proxy that runs hook(n) after the run's n-th existence read (1-based) has
+// resolved, before the run acts on it. The reads themselves pass through.
+function withExistenceReadHook(db: Db, hook: (n: number) => Promise<void> | void): Db {
+  let reads = 0;
+  return new Proxy(db as object, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop);
+      if (prop === "select") {
+        return (...args: unknown[]) => {
+          const builder = (value as (...a: unknown[]) => unknown).apply(target, args) as {
+            from: (table: unknown) => { where: (condition: unknown) => PromiseLike<unknown[]> };
+          };
+          const fields = args[0] as Record<string, unknown> | undefined;
+          if (!fields || !("shopifyOrderId" in fields)) {
+            return builder;
+          }
+          return {
+            from: (table: unknown) => ({
+              where: async (condition: unknown) => {
+                const rows = await builder.from(table).where(condition);
+                reads++;
+                await hook(reads);
+                return rows;
+              },
+            }),
+          };
+        };
+      }
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  }) as unknown as Db;
+}
+
+// Proxy whose FIRST existence read sees nothing (a racing run stored the
+// order right after it); every later read, including the re-read after an
+// insert conflict, sees the table as it is.
+function withBlindFirstExistenceRead(db: Db): Db {
+  let blinded = false;
+  return new Proxy(db as object, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop);
+      if (prop === "select") {
+        return (...args: unknown[]) => {
+          const fields = args[0] as Record<string, unknown> | undefined;
+          if (!blinded && fields && "shopifyOrderId" in fields) {
+            blinded = true;
+            return { from: () => ({ where: async () => [] }) };
+          }
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  }) as unknown as Db;
+}
+
+function allEventsIn(db: Db, wsId: string) {
+  return db.select().from(schema.events).where(eq(schema.events.workspaceId, wsId));
+}
+
+const SUPERSEDED_EMPTY: SyncResult = {
+  added: 0,
+  updated: 0,
+  addedOrderIds: [],
+  updatedOrderIds: [],
+  superseded: true,
+};
+
 function ordersIn(db: Db, wsId: string) {
   return db.select().from(schema.orders).where(eq(schema.orders.workspaceId, wsId));
 }
@@ -765,7 +880,7 @@ describe("runSync", () => {
     expect(connection.runningUntil).toBe(0);
   });
 
-  it("a superseded run still reports the rows that landed, and only those", async () => {
+  it("a superseded run writes nothing, not even an order nobody has stored yet", async () => {
     const { db, env } = await makeDb();
     await runSync(db, env, WS, {
       fetchImpl: pageFetch([rileyNode]).impl,
@@ -773,7 +888,11 @@ describe("runSync", () => {
     });
 
     // Zombie run A carries a stale snapshot of the existing order plus an
-    // order nobody has seen yet. B refreshes the existing order meanwhile.
+    // order nobody has seen yet. B takes the expired lease and refreshes the
+    // existing order meanwhile. A checks its lease once its fetch returns and
+    // stops: the order it alone fetched is not lost in practice, because A
+    // never advanced lastSyncAt or the cursor, so B's window covers it (B's
+    // scripted page here simply does not carry it).
     const stale = { ...rileyNode, note: "stale note from zombie run A" };
     const fresh = { ...rileyNode, note: "fresh note from run B" };
     const unseen = {
@@ -789,22 +908,98 @@ describe("runSync", () => {
     }) as typeof fetch;
 
     const runA = await runSync(db, env, WS, { fetchImpl: zombieFetch, now: () => NOW });
-    expect(runA.superseded).toBe(true);
+    expect(runA).toEqual(SUPERSEDED_EMPTY);
 
     const rows = await ordersIn(db, WS);
-    expect(rows).toHaveLength(2);
-    const existing = rows.find((o) => o.shopifyOrderId === "6101");
-    const inserted = rows.find((o) => o.shopifyOrderId === "6102");
+    expect(rows.map((o) => o.shopifyOrderId)).toEqual(["6101"]);
+    expect((rows[0].shopify as { note: string }).note).toBe("fresh note from run B");
+    expect(rows[0].syncedAt).toBe(LATER);
+    expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
+  });
 
-    // The insert genuinely landed, so it is reported even though A was
-    // superseded; the guarded-away update is not.
-    expect(runA.added).toBe(1);
-    expect(runA.addedOrderIds).toEqual([inserted?.id]);
-    expect(runA.updated).toBe(0);
-    expect(runA.updatedOrderIds).toEqual([]);
-    expect((existing?.shopify as { note: string }).note).toBe("fresh note from run B");
-    expect(existing?.syncedAt).toBe(LATER);
-    expect(await eventsIn(db, WS, "order_new")).toHaveLength(2);
+  it("a run superseded by a store change while its fetch is in flight writes nothing", async () => {
+    const { db, env } = await makeDb();
+    const held = heldFetch(storeOrders(3, 8001));
+    const running = runSync(db, env, WS, { fetchImpl: held.impl, now: () => NOW });
+    await held.atFetch;
+
+    const saved = await saveConnection(
+      db,
+      { workspaceId: WS, encryptionKey: TEST_KEY, fetchImpl: shopBVerified },
+      { shopDomain: "shop-b", token: "shpat_shop_b_token_0002" },
+    );
+    expect(saved.kind).toBe("saved");
+    held.release();
+
+    expect(await running).toEqual(SUPERSEDED_EMPTY);
+    expect(await ordersIn(db, WS)).toEqual([]);
+    expect(await allEventsIn(db, WS)).toEqual([]);
+    expect(await connectionOf(db, WS)).toMatchObject({
+      shopDomain: "shop-b.myshopify.com",
+      status: "ok",
+      lastError: null,
+      lastSyncAt: 0,
+      runningUntil: 0,
+      syncCursor: null,
+      syncCursorSince: null,
+    });
+  });
+
+  it("a run superseded by a disconnect while its fetch is in flight writes nothing", async () => {
+    const { db, env } = await makeDb();
+    const held = heldFetch(storeOrders(3, 8101));
+    const running = runSync(db, env, WS, { fetchImpl: held.impl, now: () => NOW });
+    await held.atFetch;
+
+    await deleteConnection(db, WS);
+    held.release();
+
+    expect(await running).toEqual(SUPERSEDED_EMPTY);
+    expect(await ordersIn(db, WS)).toEqual([]);
+    expect(await allEventsIn(db, WS)).toEqual([]);
+    expect(await connectionOf(db, WS)).toBeUndefined();
+  });
+
+  it("re-checks the lease before every existence chunk", async () => {
+    const { db, raw, env } = await makeDb();
+    let reads = 0;
+    // Another run takes the lease right after the first chunk was read.
+    const racing = withExistenceReadHook(db, (n) => {
+      reads = n;
+      if (n === 1) {
+        raw
+          .prepare("UPDATE store_connections SET running_until = ? WHERE workspace_id = ?")
+          .run(NOW + 999999, WS);
+      }
+    });
+    const result = await runSync(racing, env, WS, {
+      fetchImpl: pageFetch(storeOrders(EXISTENCE_CHUNK + 5, 8201)).impl,
+      now: () => NOW,
+    });
+
+    expect(result).toEqual(SUPERSEDED_EMPTY);
+    // The second chunk was never claimed or read.
+    expect(reads).toBe(1);
+    expect(await ordersIn(db, WS)).toEqual([]);
+    expect(await allEventsIn(db, WS)).toEqual([]);
+    expect((await connectionOf(db, WS)).runningUntil).toBe(NOW + 999999);
+  });
+
+  it("re-checks the lease once more after the last chunk, before any order is written", async () => {
+    const { db, raw, env } = await makeDb();
+    const racing = withExistenceReadHook(db, () => {
+      raw
+        .prepare("UPDATE store_connections SET running_until = ? WHERE workspace_id = ?")
+        .run(NOW + 999999, WS);
+    });
+    const result = await runSync(racing, env, WS, {
+      fetchImpl: pageFetch(storeOrders(3, 8301)).impl,
+      now: () => NOW,
+    });
+
+    expect(result).toEqual(SUPERSEDED_EMPTY);
+    expect(await ordersIn(db, WS)).toEqual([]);
+    expect(await allEventsIn(db, WS)).toEqual([]);
   });
 
   it("a zombie run cannot regress a row a newer run verified as unchanged", async () => {
@@ -878,11 +1073,12 @@ describe("runSync", () => {
     expect(runB.updated).toBe(0);
   });
 
-  it("a newer run still applies its snapshot when a zombie inserts the order first", async () => {
+  it("a zombie that wakes during a newer run's existence read inserts nothing", async () => {
     const { db, env } = await makeDb();
     // Nobody has stored the order yet. Zombie A fetched it before an edit,
-    // run B after. A's insert lands after B's existence read (B saw no row)
-    // and before B's own insert, which then conflicts.
+    // run B after. A's fetch returns after B's existence read (B saw no row);
+    // B holds the lease by then, so A stops at its lease check and the
+    // insert, the event and the snapshot are all B's.
     const staleUnseen = { ...rileyNode, note: "note before the edit" };
     const freshUnseen = { ...rileyNode, note: "note after the edit" };
     const zombie = await parkedZombie(db, env, NOW, [staleUnseen]);
@@ -897,17 +1093,40 @@ describe("runSync", () => {
 
     const rows = await ordersIn(db, WS);
     expect(rows).toHaveLength(1);
-    // The insert was A's (and is reported by A); the snapshot is B's.
-    expect(runA?.added).toBe(1);
-    expect(runA?.addedOrderIds).toEqual([rows[0].id]);
-    expect(runA?.superseded).toBe(true);
+    expect(runA).toEqual(SUPERSEDED_EMPTY);
     expect((rows[0].shopify as { note: string }).note).toBe("note after the edit");
     expect(rows[0].syncedAt).toBe(LATER);
     expect(runB.error).toBeUndefined();
-    expect(runB.added).toBe(0);
-    expect(runB.addedOrderIds).toEqual([]);
-    expect(runB.updated).toBe(1);
-    expect(runB.updatedOrderIds).toEqual([rows[0].id]);
+    expect(runB.superseded).toBeUndefined();
+    expect(runB.added).toBe(1);
+    expect(runB.addedOrderIds).toEqual([rows[0].id]);
+    expect(runB.updated).toBe(0);
+    expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
+  });
+
+  it("a run whose insert conflicts with a row stored after its existence read still applies its newer snapshot", async () => {
+    const { db, env } = await makeDb();
+    // Another run stored the order (with an older snapshot) right after this
+    // run's existence read: this run's insert is a conflict no-op, so it
+    // claims and loads that row and refreshes the snapshot instead.
+    await runSync(db, env, WS, {
+      fetchImpl: pageFetch([{ ...rileyNode, note: "note before the edit" }]).impl,
+      now: () => NOW,
+    });
+    const result = await runSync(withBlindFirstExistenceRead(db), env, WS, {
+      fetchImpl: pageFetch([{ ...rileyNode, note: "note after the edit" }]).impl,
+      now: () => LATER,
+    });
+
+    const rows = await ordersIn(db, WS);
+    expect(rows).toHaveLength(1);
+    expect(result.error).toBeUndefined();
+    expect(result.added).toBe(0);
+    expect(result.addedOrderIds).toEqual([]);
+    expect(result.updated).toBe(1);
+    expect(result.updatedOrderIds).toEqual([rows[0].id]);
+    expect((rows[0].shopify as { note: string }).note).toBe("note after the edit");
+    expect(rows[0].syncedAt).toBe(LATER);
     expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
   });
 

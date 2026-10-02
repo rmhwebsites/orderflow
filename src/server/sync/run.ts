@@ -4,7 +4,7 @@
 
 import { and, asc, desc, eq, inArray, lt, lte } from "drizzle-orm";
 import type { Db } from "../../db";
-import { applyBatch } from "../../db/batch";
+import { applyBatch, rowsAffected } from "../../db/batch";
 import { events, orders, statuses, storeConnections } from "../../db/schema";
 import { decryptSecret } from "../crypto";
 import { fetchOrdersUpdatedSince } from "../shopify/client";
@@ -51,29 +51,11 @@ function clip(text: string): string {
   return text.slice(0, LAST_ERROR_MAX);
 }
 
-// Rows affected by a write, across drivers: D1 reports meta.changes, the
-// better-sqlite3 test driver reports changes at the top level. An unknown
-// shape counts as 1 (and is logged): a double-run is idempotent, a never-run
-// is an outage.
+// Rows affected by a write, across drivers (see rowsAffected in
+// src/db/batch.ts). An unknown shape counts as 1 and is logged as "[sync]":
+// a double-run is idempotent, a never-run is an outage.
 function changesOf(result: unknown): number {
-  if (typeof result === "object" && result !== null) {
-    const direct = (result as { changes?: unknown }).changes;
-    if (typeof direct === "number") {
-      return direct;
-    }
-    const meta = (result as { meta?: { changes?: unknown } }).meta;
-    if (meta && typeof meta.changes === "number") {
-      return meta.changes;
-    }
-  }
-  let shape = "unserializable";
-  try {
-    shape = JSON.stringify(result) ?? String(result);
-  } catch {
-    // keep the fallback label
-  }
-  console.warn("[sync] unknown write result shape, assuming one row affected: " + shape);
-  return 1;
+  return rowsAffected(result, "sync");
 }
 
 // Two statements that must land together: db.batch on D1 (atomic), sequential
@@ -99,9 +81,20 @@ type ConnectionWrite = Partial<typeof storeConnections.$inferInsert>;
 // that outlived its lease can never overwrite a newer run's connection state
 // or free a lease it no longer owns.
 //
-// What the fence does NOT protect: writes to orders and events. Those happen
-// before the terminal write and are not lease-checked, so a superseded run's
-// rows can still land. They are made safe on their own terms instead:
+// What the fence does NOT cover: writes to orders and events, which are not
+// lease-conditional statements. Instead runSync re-reads its lease
+// (holdsLease) right after its fetch returns, before each further existence
+// chunk, and once more after the last chunk, just before its write loop. A
+// run that has lost the lease by then (another run took it over, a
+// connection save released it, a disconnect removed the row) returns
+// superseded and writes no order and no event. The only rows such a run may
+// have touched are the claim stamps of chunks it read before losing the
+// lease (synced_at moved forward to its now), which are harmless: any later
+// run starts with a larger now and claims past them.
+//
+// What can still land: a run superseded after its last check, that is during
+// its write loop, finishes that loop. Its first write follows its last check
+// within one round trip. Those rows are made safe on their own terms:
 // - order + order_new event inserts are conflict no-ops with a deterministic
 //   event id, so a replay or a racing run inserts nothing twice;
 // - stored snapshots follow claim-then-read (see claimAndLoad): the run that
@@ -110,6 +103,10 @@ type ConnectionWrite = Partial<typeof storeConnections.$inferInsert>;
 //   no such row;
 // - added / updated counts and ids come from rows-affected, so a write that
 //   was a no-op or was guarded away is never reported.
+// For a store change the gap is narrower still: saveConnection refuses to
+// change the shop of a workspace that has orders (the check is inside its
+// upsert), so another store's orders can only land if that upsert falls
+// between a run's last lease check and its first insert.
 // Ownership orders runs by start time, not by fetch time: a zombie's snapshot
 // is dropped even when it was fetched after the newer run's. That is safe
 // because such a change happened after the newer run's now, so the next
@@ -130,6 +127,19 @@ async function fencedConnectionWrite(
       ),
     );
   return changesOf(result) > 0;
+}
+
+// Whether this run still holds the lease it set: false once another run has
+// re-leased the row, a connection save has released it, or a disconnect has
+// removed it. Order and event writes are not lease-conditional, so runSync
+// asks this before it writes any (see the fence comment above).
+async function holdsLease(db: Db, workspaceId: string, myLease: number): Promise<boolean> {
+  const rows = await db
+    .select({ runningUntil: storeConnections.runningUntil })
+    .from(storeConnections)
+    .where(eq(storeConnections.workspaceId, workspaceId))
+    .limit(1);
+  return rows[0]?.runningUntil === myLease;
 }
 
 // What a truncated run leaves in store_connections.sync_cursor: the Shopify
@@ -343,6 +353,16 @@ export async function runSync(
       return { ...empty(), error: fetched.detail };
     }
 
+    // The fetch can take minutes. If the lease changed hands meanwhile (a
+    // newer run, a connection save, a disconnect), what was fetched may
+    // belong to a store this workspace no longer syncs: stop without writing
+    // anything. Nothing the workspace still syncs is lost, because a
+    // superseded run never advances lastSyncAt or the cursor; the next run
+    // covers the same window (after a store change, a fresh first-sync one).
+    if (!(await holdsLease(db, workspaceId, myLease))) {
+      return { ...empty(), superseded: true };
+    }
+
     const normalized = normalizeOrders(fetched.nodes);
 
     const defaultStatusRows = await db
@@ -359,8 +379,18 @@ export async function runSync(
     const existingByShopifyId = new Map<string, KnownOrder>();
     const shopifyIds = normalized.map((order) => order.shopifyOrderId);
     for (let i = 0; i < shopifyIds.length; i += EXISTENCE_CHUNK) {
+      // The first chunk follows the check above; every later one re-checks.
+      if (i > 0 && !(await holdsLease(db, workspaceId, myLease))) {
+        return { ...empty(), superseded: true };
+      }
       const chunk = shopifyIds.slice(i, i + EXISTENCE_CHUNK);
       await claimAndLoad(db, workspaceId, chunk, now, existingByShopifyId);
+    }
+    // Last check: the loop below is where this run writes order and event
+    // rows, and a run superseded from here on finishes it (see the fence
+    // comment for why those rows are safe).
+    if (shopifyIds.length > 0 && !(await holdsLease(db, workspaceId, myLease))) {
+      return { ...empty(), superseded: true };
     }
 
     const addedSet = new Set<string>();

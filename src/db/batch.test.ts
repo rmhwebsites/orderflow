@@ -1,6 +1,26 @@
 import { describe, it, expect, vi } from "vitest";
 import type { Db } from "./index";
-import { applyBatch } from "./batch";
+import { applyBatch, rowsAffected } from "./batch";
+
+describe("rowsAffected", () => {
+  it("reads the better-sqlite3 and the D1 result shapes", () => {
+    expect(rowsAffected({ changes: 2, lastInsertRowid: 9 }, "desk")).toBe(2);
+    expect(rowsAffected({ success: true, meta: { changes: 0 } }, "desk")).toBe(0);
+  });
+
+  it("counts an unknown shape as one row and logs it under the caller's label", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(rowsAffected({ rows: [] }, "desk")).toBe(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain(
+        "[desk] unknown write result shape, assuming one row affected",
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
 
 describe("applyBatch", () => {
   it("routes every statement through one db.batch call without awaiting them individually", async () => {
