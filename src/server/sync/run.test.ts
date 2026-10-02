@@ -959,7 +959,49 @@ describe("runSync", () => {
     expect(await running).toEqual(SUPERSEDED_EMPTY);
     expect(await ordersIn(db, WS)).toEqual([]);
     expect(await allEventsIn(db, WS)).toEqual([]);
-    expect(await connectionOf(db, WS)).toBeUndefined();
+    // Disconnect is disable: the row stays, disabled, secrets cleared, and
+    // the superseded run left it exactly so.
+    expect(await connectionOf(db, WS)).toMatchObject({
+      status: "disabled",
+      encryptedToken: "",
+      lastError: null,
+      runningUntil: 0,
+      lastSyncAt: 0,
+    });
+    // The next tick skips it.
+    expect(await runSync(db, env, WS, { fetchImpl: pageFetch([]).impl, now: () => LATER })).toMatchObject({
+      skipped: "disabled",
+    });
+  });
+
+  // Pins the check right after the fetch returns (before any existence
+  // chunk). The later checks would still stop the run before it writes an
+  // order, but only after the first chunk had been claimed and read; this
+  // test fails if the post-fetch check goes away.
+  it("stops right after the fetch when the lease was released meanwhile: no claim, no existence read", async () => {
+    const { db, raw, env } = await makeDb();
+    await runSync(db, env, WS, { fetchImpl: pageFetch([rileyNode]).impl, now: () => NOW - 600000 });
+    const [stored] = await ordersIn(db, WS);
+    expect(stored.syncedAt).toBe(NOW - 600000);
+
+    let reads = 0;
+    const counting = withExistenceReadHook(db, (n) => {
+      reads = n;
+    });
+    const held = heldFetch([{ ...rileyNode, note: "edited while the lease was released" }]);
+    const running = runSync(counting, env, WS, { fetchImpl: held.impl, now: () => NOW });
+    await held.atFetch;
+    // A connection save (or a disconnect) releases the lease mid-fetch.
+    raw.prepare("UPDATE store_connections SET running_until = 0 WHERE workspace_id = ?").run(WS);
+    held.release();
+
+    expect(await running).toEqual(SUPERSEDED_EMPTY);
+    expect(reads).toBe(0);
+    const [after] = await ordersIn(db, WS);
+    expect(after.syncedAt).toBe(NOW - 600000);
+    expect((after.shopify as { note: string }).note).toBe("original note");
+    expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
+    expect((await connectionOf(db, WS)).runningUntil).toBe(0);
   });
 
   it("re-checks the lease before every existence chunk", async () => {

@@ -87,10 +87,12 @@ export async function manualSync(
 
   const result = await run(db, env, workspaceId);
   // The cooldown only counts runs that did real work: skipped runs (lease
-  // held, no connection, disabled) and fruitless failures can be retried
-  // immediately.
-  const fruitlessError = Boolean(result.error) && result.added + result.updated === 0;
-  if (connection && !result.skipped && !fruitlessError) {
+  // held, no connection, disabled), fruitless failures and fruitless
+  // superseded runs (another run, a connection save or a disconnect took
+  // the lease mid-run) can be retried immediately.
+  const fruitless =
+    (Boolean(result.error) || result.superseded === true) && result.added + result.updated === 0;
+  if (connection && !result.skipped && !fruitless) {
     await db
       .update(storeConnections)
       .set({ lastManualSyncAt: now })

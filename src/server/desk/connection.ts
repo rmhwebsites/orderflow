@@ -92,8 +92,11 @@ const CANNOT_READ_ORDERS =
   "This token cannot read orders. Give the Shopify app the read_orders permission and try again.";
 const STORE_CHANGE_REFUSED =
   "This workspace already has orders from another store. Create a new workspace for a different store.";
-// read_all_orders reaches past the 60 day window and implies read_orders.
-const ORDER_SCOPES = ["read_orders", "read_all_orders"];
+// Order-reading access: read_orders, or write_orders (which implies read
+// access; Shopify may list only the write handle). read_all_orders only
+// widens the window past 60 days on top of one of these, so it is optional
+// and does not count on its own.
+const ORDER_SCOPES = ["read_orders", "write_orders"];
 
 export type ConnectionContext = {
   workspaceId: string;
@@ -150,7 +153,12 @@ async function storeChangeBlocked(db: Db, workspaceId: string, shopDomain: strin
 // A workspace is one business with one store: once it has orders, a save
 // that names another shop is refused and nothing changes. A changed domain
 // on a workspace with no orders, or a new token for the same domain, is
-// saved.
+// saved. A disconnected (disabled) row counts as the workspace's store for
+// this rule, and a successful save re-enables it.
+//
+// The save stores a legacy Admin API token (auth_mode legacy_token) with
+// the verified shop name and scopes, and clears any client-credentials
+// fields so the row describes one mode only.
 //
 // On save the connection is marked ok with no last error. A new row, or a
 // row whose shop domain changed, also starts over: lastSyncAt 0 and no sync
@@ -210,6 +218,15 @@ export async function saveConnection(
   let encryptedToken: string | undefined;
   try {
     encryptedToken = await encryptSecret(token, ctx.encryptionKey, ctx.workspaceId);
+    const legacyFields = {
+      authMode: "legacy_token" as const,
+      clientId: null,
+      encryptedClientSecret: null,
+      encryptedAccessToken: null,
+      accessTokenExpiresAt: null,
+      scopes: check.accessScopes,
+      shopName: check.shopName,
+    };
     const sameShop = sql`${storeConnections.shopDomain} = excluded.shop_domain`;
     const noOrders = sql`not exists (select 1 from ${orders} where ${orders.workspaceId} = ${ctx.workspaceId})`;
     const rows = await db
@@ -218,6 +235,7 @@ export async function saveConnection(
         workspaceId: ctx.workspaceId,
         shopDomain,
         encryptedToken,
+        ...legacyFields,
         status: "ok",
         lastError: null,
         lastSyncAt: 0,
@@ -231,6 +249,7 @@ export async function saveConnection(
         set: {
           shopDomain,
           encryptedToken,
+          ...legacyFields,
           status: "ok",
           lastError: null,
           runningUntil: 0,
@@ -269,7 +288,26 @@ export async function saveConnection(
   }
 }
 
-// Disconnects the store. Orders and their history stay.
+// Disconnects the store by disabling its row rather than deleting it, so
+// the one-store-per-workspace rule (saveConnection) still knows which store
+// this workspace's orders came from. Every stored secret is cleared (the
+// token column cannot be null, so it becomes empty), the last error goes,
+// and the sync lease is released: a run in flight sees the lease change and
+// writes nothing (see runSync), and the cron skips disabled rows. Sync
+// progress (lastSyncAt, cursor) stays, so reconnecting the same store
+// resumes where it left off. Orders and their history stay. A no-op for a
+// workspace with no connection.
 export async function deleteConnection(db: Db, workspaceId: string): Promise<void> {
-  await db.delete(storeConnections).where(eq(storeConnections.workspaceId, workspaceId));
+  await db
+    .update(storeConnections)
+    .set({
+      status: "disabled",
+      encryptedToken: "",
+      encryptedClientSecret: null,
+      encryptedAccessToken: null,
+      accessTokenExpiresAt: null,
+      lastError: null,
+      runningUntil: 0,
+    })
+    .where(eq(storeConnections.workspaceId, workspaceId));
 }

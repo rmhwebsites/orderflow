@@ -132,6 +132,23 @@ describe("manualSync cooldown stamp", () => {
     expect(await lastManualSyncAt(db)).toBe(0);
   });
 
+  // A superseded run wrote nothing of its own terminal state (another run,
+  // a connection save or a disconnect took the lease), so when it landed no
+  // order either, nothing happened and the person may retry at once.
+  it("does not stamp a superseded run that landed nothing", async () => {
+    const db = await setup({ lastManualSyncAt: 0 });
+    const { run } = fakeRun(result({ superseded: true }));
+    await manualSync(db, env, WS, { now: NOW, run });
+    expect(await lastManualSyncAt(db)).toBe(0);
+  });
+
+  it("stamps a superseded run that still landed orders", async () => {
+    const db = await setup({ lastManualSyncAt: 0 });
+    const { run } = fakeRun(result({ superseded: true, added: 2, addedOrderIds: ["o1", "o2"] }));
+    await manualSync(db, env, WS, { now: NOW, run });
+    expect(await lastManualSyncAt(db)).toBe(NOW);
+  });
+
   it("does not stamp a skipped run", async () => {
     const db = await setup({ lastManualSyncAt: 0 });
     const { run } = fakeRun(result({ skipped: "running" }));

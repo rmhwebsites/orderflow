@@ -289,14 +289,54 @@ describe("saveConnection", () => {
     expect(await connectionRow(db)).toEqual(before);
   });
 
-  it("accepts read_all_orders in place of read_orders", async () => {
+  // write_orders implies read_orders, and Shopify may list only the write
+  // handle. read_all_orders is optional on top of either.
+  it("accepts write_orders in place of read_orders", async () => {
+    const db = await setup();
+    const result = await saveConnection(
+      db,
+      ctx(shopFetch(200, verifiedBody(["write_orders"])).impl),
+      { shopDomain: "impactrentals", token: TOKEN },
+    );
+    expect(result.kind).toBe("saved");
+  });
+
+  it("accepts read_orders or write_orders with read_all_orders alongside", async () => {
+    for (const handles of [["read_orders", "read_all_orders"], ["write_orders", "read_all_orders"]]) {
+      const db = await setup();
+      const result = await saveConnection(db, ctx(shopFetch(200, verifiedBody(handles)).impl), {
+        shopDomain: "impactrentals",
+        token: TOKEN,
+      });
+      expect(result.kind, JSON.stringify(handles)).toBe("saved");
+    }
+  });
+
+  it("does not count read_all_orders alone as order access", async () => {
     const db = await setup();
     const result = await saveConnection(
       db,
       ctx(shopFetch(200, verifiedBody(["read_all_orders"])).impl),
       { shopDomain: "impactrentals", token: TOKEN },
     );
-    expect(result.kind).toBe("saved");
+    expect(result.kind).toBe("rejected");
+  });
+
+  it("records the verified shop name and scopes as a legacy token connection", async () => {
+    const db = await setup();
+    await saveConnection(db, ctx(shopFetch(200, verifiedBody(["read_orders", "write_orders"])).impl), {
+      shopDomain: "impactrentals",
+      token: TOKEN,
+    });
+    expect(await connectionRow(db)).toMatchObject({
+      authMode: "legacy_token",
+      shopName: "IMPACT Rentals",
+      scopes: ["read_orders", "write_orders"],
+      clientId: null,
+      encryptedClientSecret: null,
+      encryptedAccessToken: null,
+      accessTokenExpiresAt: null,
+    });
   });
 
   it("answers a Shopify 404 as no store at this address, and saves nothing", async () => {
@@ -457,25 +497,94 @@ describe("saveConnection", () => {
   });
 });
 
+// Disconnect is disable: the row stays (so the one-store rule still knows
+// which store the workspace's orders came from), every stored secret goes.
 describe("deleteConnection", () => {
-  it("removes the connection row and keeps the orders", async () => {
+  it("disables the connection, clears every secret, the error and the lease, and keeps the orders", async () => {
     const db = await setup();
-    await seedConnection(db);
+    await seedConnection(db, {
+      authMode: "client_credentials",
+      clientId: "client-id-123",
+      encryptedClientSecret: "v1.secret-ciphertext",
+      encryptedAccessToken: "v1.access-ciphertext",
+      accessTokenExpiresAt: 1_759_100_000_000,
+    });
     await seedOrder(db, WS, { id: "o1" });
 
     await deleteConnection(db, WS);
-    expect(await connectionRow(db)).toBeUndefined();
+    expect(await connectionRow(db)).toMatchObject({
+      shopDomain: "impactrentals.myshopify.com",
+      status: "disabled",
+      encryptedToken: "",
+      encryptedClientSecret: null,
+      encryptedAccessToken: null,
+      accessTokenExpiresAt: null,
+      lastError: null,
+      runningUntil: 0,
+      // Sync progress stays, so reconnecting the same store resumes.
+      lastSyncAt: 1_759_000_000_000,
+      syncCursor: "1759000000000|cursor-abc",
+    });
     const orders = await db.select().from(schema.orders).where(eq(schema.orders.workspaceId, WS));
     expect(orders.map((o) => o.id)).toEqual(["o1"]);
 
-    // Idempotent.
+    // Idempotent, and a no-op without a connection.
     await expect(deleteConnection(db, WS)).resolves.toBeUndefined();
+    await expect(deleteConnection(db, OTHER)).resolves.toBeUndefined();
+    expect(await connectionRow(db, OTHER)).toBeUndefined();
   });
 
   it("only touches its own workspace", async () => {
     const db = await setup();
     await seedConnection(db);
     await deleteConnection(db, OTHER);
-    expect(await connectionRow(db)).toBeDefined();
+    expect((await connectionRow(db)).status).toBe("error");
+  });
+
+  it("lets the same store reconnect and re-enables it with sync progress kept", async () => {
+    const db = await setup();
+    await seedConnection(db);
+    await seedOrder(db, WS, { id: "o1" });
+    await deleteConnection(db, WS);
+
+    const result = await saveConnection(db, ctx(okShop().impl), {
+      shopDomain: "impactrentals",
+      token: NEW_TOKEN,
+    });
+    expect(result).toMatchObject({ kind: "saved", connection: { status: "ok", lastSyncAt: 1_759_000_000_000 } });
+    const row = await connectionRow(db);
+    expect(row).toMatchObject({ status: "ok", lastError: null, syncCursor: "1759000000000|cursor-abc" });
+    expect(await decryptSecret(row.encryptedToken, KEY, WS)).toBe(NEW_TOKEN);
+  });
+
+  it("refuses a different store after a disconnect while the workspace has orders", async () => {
+    const db = await setup();
+    await seedConnection(db);
+    await seedOrder(db, WS, { id: "o1" });
+    await deleteConnection(db, WS);
+    const before = await connectionRow(db);
+    const shop = okShop();
+
+    const result = await saveConnection(db, ctx(shop.impl), { shopDomain: "impact-two", token: NEW_TOKEN });
+    expect(result).toEqual({ kind: "store-change", error: STORE_CHANGE_ERROR });
+    expect(shop.calls).toHaveLength(0);
+    expect(await connectionRow(db)).toEqual(before);
+  });
+
+  it("accepts a different store after a disconnect when the workspace has no orders, starting sync over", async () => {
+    const db = await setup();
+    await seedConnection(db);
+    await deleteConnection(db, WS);
+
+    const result = await saveConnection(db, ctx(okShop().impl), { shopDomain: "impact-two", token: NEW_TOKEN });
+    expect(result).toMatchObject({ kind: "saved", connection: { shopDomain: "impact-two.myshopify.com", lastSyncAt: 0 } });
+    expect(await connectionRow(db)).toMatchObject({
+      shopDomain: "impact-two.myshopify.com",
+      status: "ok",
+      lastSyncAt: 0,
+      syncCursor: null,
+      syncCursorSince: null,
+      runningUntil: 0,
+    });
   });
 });

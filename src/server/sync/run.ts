@@ -86,7 +86,7 @@ type ConnectionWrite = Partial<typeof storeConnections.$inferInsert>;
 // (holdsLease) right after its fetch returns, before each further existence
 // chunk, and once more after the last chunk, just before its write loop. A
 // run that has lost the lease by then (another run took it over, a
-// connection save released it, a disconnect removed the row) returns
+// connection save or a disconnect released it) returns
 // superseded and writes no order and no event. The only rows such a run may
 // have touched are the claim stamps of chunks it read before losing the
 // lease (synced_at moved forward to its now), which are harmless: any later
@@ -130,8 +130,9 @@ async function fencedConnectionWrite(
 }
 
 // Whether this run still holds the lease it set: false once another run has
-// re-leased the row, a connection save has released it, or a disconnect has
-// removed it. Order and event writes are not lease-conditional, so runSync
+// re-leased the row, or a connection save or a disconnect (which disables
+// the row) has released it; also false if the row is gone. Order and event
+// writes are not lease-conditional, so runSync
 // asks this before it writes any (see the fence comment above).
 async function holdsLease(db: Db, workspaceId: string, myLease: number): Promise<boolean> {
   const rows = await db
