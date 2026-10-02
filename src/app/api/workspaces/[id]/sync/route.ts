@@ -1,90 +1,35 @@
-import { eq } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { getCloudflareContext } from "@opennextjs/cloudflare";
-import { storeConnections } from "@/db/schema";
+import { getSyncConnection, manualSync, manualSyncResponse } from "@/server/desk/sync";
 import { guardResponse, requireMember } from "@/server/guard";
-import { runSync } from "@/server/sync/run";
 
 type RouteContext = { params: Promise<{ id: string }> };
 
-// A manual sync may run at most once per 30 seconds per workspace.
-const MANUAL_SYNC_COOLDOWN_MS = 30000;
-
-// Connection card data as { connection: {...} | null }; Phase 5 builds
-// against this shape.
+// Connection card data: {connection: {shopDomain, status, lastSyncAt,
+// lastError, catchingUp} | null}. Never the token.
 export async function GET(_request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
     const { db } = await requireMember(id, "member");
-    const rows = await db
-      .select()
-      .from(storeConnections)
-      .where(eq(storeConnections.workspaceId, id))
-      .limit(1);
-    const connection = rows[0];
-    if (!connection) {
-      return NextResponse.json({ connection: null });
-    }
-    return NextResponse.json({
-      connection: {
-        lastSyncAt: connection.lastSyncAt,
-        status: connection.status,
-        lastError: connection.lastError,
-        shopDomain: connection.shopDomain,
-      },
-    });
+    return NextResponse.json({ connection: await getSyncConnection(db, id) });
   } catch (e) {
     return guardResponse(e);
   }
 }
 
+// Manual sync: 200 with the sync result (skipped runs included); 429
+// {error} with Retry-After seconds inside the 30 second cooldown; 502
+// {error, added, updated} when the run failed, with what still landed.
 export async function POST(_request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
     const { db } = await requireMember(id, "member");
-
-    const now = Date.now();
-    const rows = await db
-      .select()
-      .from(storeConnections)
-      .where(eq(storeConnections.workspaceId, id))
-      .limit(1);
-    const connection = rows[0];
-    if (connection && connection.lastManualSyncAt > now - MANUAL_SYNC_COOLDOWN_MS) {
-      const retryAfterSeconds = Math.ceil(
-        (connection.lastManualSyncAt + MANUAL_SYNC_COOLDOWN_MS - now) / 1000,
-      );
-      return NextResponse.json(
-        { error: "Sync already ran in the last 30 seconds" },
-        { status: 429, headers: { "Retry-After": String(retryAfterSeconds) } },
-      );
-    }
-
     const { env } = getCloudflareContext();
-    const result = await runSync(db, env, id);
-    // The cooldown only counts runs that did real work: skipped runs (lease
-    // held, no connection, disabled) and fruitless failures can be retried
-    // immediately.
-    const fruitlessError = Boolean(result.error) && result.added + result.updated === 0;
-    if (connection && !result.skipped && !fruitlessError) {
-      await db
-        .update(storeConnections)
-        .set({ lastManualSyncAt: now })
-        .where(eq(storeConnections.workspaceId, id));
-    }
+    const outcome = await manualSync(db, env, id);
     // Phase 5/6 hook point: broadcast/notify from result.addedOrderIds and
     // result.updatedOrderIds here.
-
-    if (result.error) {
-      // 502 with the partial counts so the connection card can surface both
-      // the failure text and what still landed.
-      return NextResponse.json(
-        { error: result.error, added: result.added, updated: result.updated },
-        { status: 502 },
-      );
-    }
-    // 200 even for skipped results; the card renders the skip reason.
-    return NextResponse.json(result);
+    const reply = manualSyncResponse(outcome);
+    return NextResponse.json(reply.body, { status: reply.status, headers: reply.headers });
   } catch (e) {
     return guardResponse(e);
   }
