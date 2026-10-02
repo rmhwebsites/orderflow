@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "order-desk",
+  "name": "orderflow",
   "main": "custom-worker.ts",
   "compatibility_date": "2026-09-01",
   // global_fetch_strictly_public: lets the Worker fetch its own public hostname
@@ -25,6 +25,10 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WorkspaceRoom"] }],
   "triggers": { "crons": ["*/10 * * * *"] },
   "observability": { "enabled": true },
-  // Local development reads APP_URL from .dev.vars instead
-  "vars": { "APP_URL": "https://order-desk.restless-fog-f3c0.workers.dev" }
+  // Local development reads APP_URL from .dev.vars instead. EMAIL_FROM's domain
+  // must be onboarded under Email Service > Email Sending in this account.
+  "vars": {
+    "APP_URL": "https://orderflow.restless-fog-f3c0.workers.dev",
+    "EMAIL_FROM": "Order Desk <orders@impactrentals.store>"
+  }
 }

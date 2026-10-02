@@ -22,6 +22,10 @@ export function getAuth() {
     // Rate-limit counters persist in D1 (rate_limit table); the in-memory
     // default resets per isolate, which is useless on Workers.
     rateLimit: { storage: "database" },
+    // Cloudflare sets cf-connecting-ip on every request and overwrites any
+    // client-sent value, so it is the trustworthy key for rate limiting.
+    // Without it every visitor shares one global bucket per path.
+    advanced: { ipAddress: { ipAddressHeaders: ["cf-connecting-ip"] } },
     plugins: [
       magicLink({
         async sendMagicLink({ email, url }) {

@@ -9,6 +9,13 @@
 // (Workers Paid) before production email can send from it.
 export const DEFAULT_FROM = "Order Desk <orders@impactrentals.store>";
 
+// The sender actually used: EMAIL_FROM (wrangler.jsonc vars) when set, else
+// DEFAULT_FROM. Whatever domain it names must be onboarded for Email Sending
+// in the same Cloudflare account as this Worker, or every send is refused.
+export function defaultFrom(env: CloudflareEnv): string {
+  return env.EMAIL_FROM || DEFAULT_FROM;
+}
+
 export interface SendEmailOptions {
   from: string;
   to: string[];

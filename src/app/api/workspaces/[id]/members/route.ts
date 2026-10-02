@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { pendingInvites, user, workspaceMembers, workspaces } from "@/db/schema";
 import { escapeHtml, sanitizeSubject } from "@/server/email/escape";
-import { DEFAULT_FROM, sendEmail } from "@/server/email/send";
+import { defaultFrom, sendEmail } from "@/server/email/send";
 import { AuthError, guardResponse, requireMember, roleAtLeast } from "@/server/guard";
 
 type RouteContext = { params: Promise<{ id: string }> };
@@ -110,7 +110,7 @@ export async function POST(request: Request, context: RouteContext) {
     const safeName = escapeHtml(workspaceName);
     const { env } = getCloudflareContext();
     await sendEmail(env, {
-      from: DEFAULT_FROM,
+      from: defaultFrom(env),
       to: [email],
       subject: `You have been added to ${sanitizeSubject(workspaceName)} on Order Desk`,
       html: [

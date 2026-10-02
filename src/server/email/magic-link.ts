@@ -1,4 +1,4 @@
-import { DEFAULT_FROM, sendEmail } from "./send";
+import { defaultFrom, sendEmail } from "./send";
 
 export async function sendMagicLinkEmail(
   env: CloudflareEnv,
@@ -6,7 +6,7 @@ export async function sendMagicLinkEmail(
   url: string,
 ): Promise<void> {
   await sendEmail(env, {
-    from: DEFAULT_FROM,
+    from: defaultFrom(env),
     to: [email],
     subject: "Sign in to Order Desk",
     html: [
