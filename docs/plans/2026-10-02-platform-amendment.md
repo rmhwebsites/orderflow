@@ -110,7 +110,36 @@ wherever they conflict. Original: `2026-10-01-order-desk-design.md`.
 - Sign-in emails requested on a client host come from that workspace's
   sender; sign-in emails on orderingdesk.com come from the platform sender.
 
-## 6. Carried over from the original Phase 5 part B
+## 6. Full per-workspace branding (Ryan, Oct 2)
+
+Goal: a client's workspace should feel like part of their online store.
+Platform admins set, per workspace, with a live preview in Settings:
+
+- **Logo** (full horizontal) and **symbol** (square mark), each with an
+  optional dark-mode version. Symbol doubles as the browser tab icon.
+- **Colors**: primary (buttons, highlights, active filters), ink (headings
+  and text), and page background for light mode; dark mode is derived
+  automatically from those choices, with optional overrides. Contrast is
+  checked live: combinations below WCAG AA for text or controls are shown as
+  failing and cannot be saved without picking a passing alternative (the app
+  suggests the nearest passing shade). Status colors stay semantic and are
+  not overridden by the brand palette.
+- **Fonts**: heading font and body font, each picked from a curated list of
+  Google Fonts plus a system-font option, loaded at runtime only for that
+  workspace. Order numbers and money keep the tabular monospace font so
+  columns still line up.
+- **Corner radius**: one choice per workspace that drives every surface and
+  control together (Sharp, Subtle, Soft, Rounded, Pill), so the radius
+  system stays consistent.
+- Where it applies: every workspace screen, the sign-in page on the
+  workspace's own host, and workspace emails (logo PNG, primary color, the
+  chosen fonts with web-safe fallbacks since most mail clients ignore web
+  fonts). orderingdesk.com itself keeps the Ordering Desk look.
+- Stored in the workspaces.branding JSON alongside the logo assets; every
+  value is validated server side (hex colors only, font from the allowlist,
+  radius from the enum) because these values reach CSS.
+
+## 7. Carried over from the original Phase 5 part B
 
 - Settings screens for every section above, branding uploads (symbol and full
   logo, each with an optional dark version; SVG sanitized, PNG copies stored
