@@ -5,6 +5,7 @@ import { WarningIcon } from "@phosphor-icons/react/Warning";
 import { roleAtLeast } from "@/lib/roles";
 import { syncChipState } from "@/lib/sync-status";
 import { useWorkspace } from "./workspace-provider";
+import { SETTINGS_PAGE_AVAILABLE } from "@/lib/features";
 
 function landed(added: number, updated: number): string {
   const parts = [];
@@ -39,7 +40,7 @@ export function SyncBanner() {
           <span className="break-words">{detail}</span>
           {failure ? landed(failure.added, failure.updated) : null}
         </p>
-        {roleAtLeast(role, "admin") ? (
+        {SETTINGS_PAGE_AVAILABLE && roleAtLeast(role, "admin") ? (
           <Link
             href={`/w/${workspace.slug}/settings`}
             className="shrink-0 font-semibold underline decoration-1 underline-offset-2 hover:decoration-2"

@@ -15,6 +15,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { ui } from "@/components/ui";
 import { useWorkspace } from "./workspace-provider";
 import { WorkspaceBrandSlot } from "./workspace-brand-slot";
+import { SETTINGS_PAGE_AVAILABLE } from "@/lib/features";
 
 const LIVE_TEXT = {
   live: "Live updates on",
@@ -111,10 +112,12 @@ export function TopBar({ name, logoUrl }: { name: string; logoUrl: string | null
 
         <div className="order-2 flex items-center gap-1 sm:order-3">
           <ThemeToggle />
-          <Link href={`/w/${workspace.slug}/settings`} className={`${ui.buttonQuiet} h-10`}>
-            <GearSixIcon size={18} aria-hidden />
-            <span className="sr-only sm:not-sr-only">Settings</span>
-          </Link>
+          {SETTINGS_PAGE_AVAILABLE ? (
+            <Link href={`/w/${workspace.slug}/settings`} className={`${ui.buttonQuiet} h-10`}>
+              <GearSixIcon size={18} aria-hidden />
+              <span className="sr-only sm:not-sr-only">Settings</span>
+            </Link>
+          ) : null}
         </div>
       </div>
     </header>
