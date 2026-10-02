@@ -112,6 +112,9 @@ export function TopBar({ name, logoUrl }: { name: string; logoUrl: string | null
 
         <div className="order-2 flex items-center gap-1 sm:order-3">
           <ThemeToggle />
+          {/* Hidden for everyone until the settings page exists. SETTINGS
+              STAGE: restore it through SETTINGS_PAGE_AVAILABLE in
+              src/lib/features.ts. */}
           {SETTINGS_PAGE_AVAILABLE ? (
             <Link href={`/w/${workspace.slug}/settings`} className={`${ui.buttonQuiet} h-10`}>
               <GearSixIcon size={18} aria-hidden />

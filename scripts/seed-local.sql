@@ -12,16 +12,20 @@
 --    Re-running it resets the sample orders, events and statuses; the
 --    workspace row and its members are kept.
 --
--- 2. Sign in locally:
+-- 2. Sign in locally. Sign-up is closed: put your address in
+--    PLATFORM_ADMIN_EMAILS in .dev.vars first (see .dev.vars.example), or
+--    the sign-in link is never sent. Then:
 --      npm run dev
 --    open http://localhost:3000/sign-in and enter your email. Local dev
 --    never sends email: the dev server log prints a line starting with
 --    [email-fallback] whose "url" is the magic link. Open that URL in the
 --    same browser to finish signing in.
 --
--- 3. Add yourself to the sample workspace (your user row exists after the
---    first sign-in; replace the address with the one you signed in with):
---      npx wrangler d1 execute orderingdesk --local --command "INSERT INTO workspace_members (id, workspace_id, user_id, role) SELECT 'sample-member-' || id, 'sample-ws-example-co', id, 'owner' FROM user WHERE email = 'you@example.com' ON CONFLICT DO NOTHING;"
+-- 3. As a platform admin you already see every workspace. To see the app
+--    as a client instead, take your address out of PLATFORM_ADMIN_EMAILS
+--    and add yourself to the sample workspace (your user row exists after
+--    the first sign-in; replace the address with the one you signed in with):
+--      npx wrangler d1 execute orderingdesk --local --command "INSERT INTO workspace_members (id, workspace_id, user_id, role) SELECT 'sample-member-' || id, 'sample-ws-example-co', id, 'manager' FROM user WHERE email = 'you@example.com' ON CONFLICT DO NOTHING;"
 --
 -- 4. Open http://localhost:3000/w/example-co
 --
@@ -46,7 +50,7 @@ VALUES ('sample-user-marta', 'Marta Ruiz (sample)', 'marta.ruiz.sample@example.c
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO workspace_members (id, workspace_id, user_id, role, last_seen_at)
-VALUES ('sample-member-marta', 'sample-ws-example-co', 'sample-user-marta', 'member', 0)
+VALUES ('sample-member-marta', 'sample-ws-example-co', 'sample-user-marta', 'staff', 0)
 ON CONFLICT DO NOTHING;
 
 -- Reset the sample content.
@@ -55,14 +59,14 @@ DELETE FROM orders WHERE workspace_id = 'sample-ws-example-co';
 DELETE FROM statuses WHERE workspace_id = 'sample-ws-example-co';
 
 -- The seven default statuses, as POST /api/workspaces seeds them.
-INSERT INTO statuses (id, workspace_id, key, label, color, sort, triggers_po) VALUES
-  ('sample-st-new', 'sample-ws-example-co', 'new', 'New', 'lime', 0, 0),
-  ('sample-st-processing', 'sample-ws-example-co', 'processing', 'Processing', 'blue', 1, 0),
-  ('sample-st-on-hold', 'sample-ws-example-co', 'on_hold', 'On Hold', 'amber', 2, 0),
-  ('sample-st-approved', 'sample-ws-example-co', 'approved', 'Approved', 'green', 3, 1),
-  ('sample-st-shipped', 'sample-ws-example-co', 'shipped', 'Shipped', 'violet', 4, 0),
-  ('sample-st-delivered', 'sample-ws-example-co', 'delivered', 'Delivered', 'slate', 5, 0),
-  ('sample-st-issue', 'sample-ws-example-co', 'issue', 'Issue', 'red', 6, 0);
+INSERT INTO statuses (id, workspace_id, key, label, color, sort, triggers_po, shopify_link) VALUES
+  ('sample-st-new', 'sample-ws-example-co', 'new', 'New', 'lime', 0, 0, NULL),
+  ('sample-st-processing', 'sample-ws-example-co', 'processing', 'Processing', 'blue', 1, 0, NULL),
+  ('sample-st-on-hold', 'sample-ws-example-co', 'on_hold', 'On Hold', 'amber', 2, 0, NULL),
+  ('sample-st-approved', 'sample-ws-example-co', 'approved', 'Approved', 'green', 3, 1, NULL),
+  ('sample-st-shipped', 'sample-ws-example-co', 'shipped', 'Shipped', 'violet', 4, 0, 'fulfilled'),
+  ('sample-st-delivered', 'sample-ws-example-co', 'delivered', 'Delivered', 'slate', 5, 0, 'delivered'),
+  ('sample-st-issue', 'sample-ws-example-co', 'issue', 'Issue', 'red', 6, 0, NULL);
 
 -- Orders, newest first. The snapshot JSON matches what the sync stores.
 INSERT INTO orders (id, workspace_id, shopify_order_id, name, shopify, status_key, status_set_by, status_set_at, created_at, synced_at) VALUES

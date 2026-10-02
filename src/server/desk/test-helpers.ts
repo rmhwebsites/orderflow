@@ -58,11 +58,33 @@ export function withBatch(db: Db, record: unknown[][]): Db {
 }
 
 export const TEST_STATUSES = [
-  { key: "new", label: "New", color: "lime", triggersPo: false },
-  { key: "processing", label: "Processing", color: "blue", triggersPo: false },
-  { key: "approved", label: "Approved", color: "green", triggersPo: true },
-  { key: "shipped", label: "Shipped", color: "violet", triggersPo: false },
+  { key: "new", label: "New", color: "lime", triggersPo: false, shopifyLink: null },
+  { key: "processing", label: "Processing", color: "blue", triggersPo: false, shopifyLink: null },
+  { key: "approved", label: "Approved", color: "green", triggersPo: true, shopifyLink: null },
+  { key: "shipped", label: "Shipped", color: "violet", triggersPo: false, shopifyLink: "fulfilled" as const },
 ];
+
+// A better-auth user row (emails are stored lowercased, as better-auth does).
+export async function seedUser(db: Db, id: string, email: string, name = "") {
+  await db.insert(schema.user).values({ id, email: email.toLowerCase(), name, emailVerified: true });
+}
+
+// A membership row; source defaults to manual like the column.
+export async function seedMember(
+  db: Db,
+  workspaceId: string,
+  userId: string,
+  role: "manager" | "staff",
+  source: "manual" | "shopify" = "manual",
+) {
+  await db.insert(schema.workspaceMembers).values({
+    id: `${workspaceId}_${userId}`,
+    workspaceId,
+    userId,
+    role,
+    source,
+  });
+}
 
 // A workspace with its settings row and TEST_STATUSES (sort = list position),
 // the way POST /api/workspaces creates one.

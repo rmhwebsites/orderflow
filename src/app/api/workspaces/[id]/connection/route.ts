@@ -5,7 +5,8 @@ import { guardResponse, requireMember } from "@/server/guard";
 
 type RouteContext = { params: Promise<{ id: string }> };
 
-// OWNER ONLY, both methods: this route carries the Shopify access token.
+// PLATFORM ADMINS ONLY, both methods (404 for anyone else): this route
+// carries the Shopify access token.
 // Never log the request body or echo the token. Errors thrown by
 // saveConnection are already redacted (no token, no ciphertext, no cause
 // chain), so guardResponse may log them.
@@ -19,7 +20,7 @@ type RouteContext = { params: Promise<{ id: string }> };
 export async function PUT(request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const { db } = await requireMember(id, "owner");
+    const { db } = await requireMember(id, "platform");
     const body = (await request.json().catch(() => null)) as unknown;
     const { env } = getCloudflareContext();
     const result = await saveConnection(
@@ -44,11 +45,13 @@ export async function PUT(request: Request, context: RouteContext) {
   }
 }
 
-// Disconnects the store; orders stay.
+// Disconnects the store: the connection row stays, disabled, with every
+// stored secret cleared, so the one-store-per-workspace rule survives (see
+// deleteConnection). Orders stay.
 export async function DELETE(_request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const { db } = await requireMember(id, "owner");
+    const { db } = await requireMember(id, "platform");
     await deleteConnection(db, id);
     return NextResponse.json({ ok: true });
   } catch (e) {

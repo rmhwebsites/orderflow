@@ -347,6 +347,7 @@ export async function runSync(
             type: "sync_error",
             text: detail,
             createdAt: now,
+            source: "system",
           });
         }
       }
@@ -427,6 +428,7 @@ export async function runSync(
             text: `New order ${order.name}${order.customerName ? " from " + order.customerName : ""}`,
             meta: { orderName: order.name },
             createdAt: now,
+            source: "shopify",
           })
           .onConflictDoNothing();
         const [orderInsertResult] = await applyPair(db, insertOrder, insertEvent);

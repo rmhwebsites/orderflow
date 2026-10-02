@@ -11,7 +11,7 @@ type RouteContext = { params: Promise<{ id: string }> };
 export async function PUT(request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const { db } = await requireMember(id, "admin");
+    const { db } = await requireMember(id, "manager");
     const body = (await request.json().catch(() => null)) as unknown;
     const result = await replaceStatuses(db, id, body);
     switch (result.kind) {

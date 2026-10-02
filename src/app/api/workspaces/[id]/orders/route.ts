@@ -10,7 +10,7 @@ type RouteContext = { params: Promise<{ id: string }> };
 export async function GET(_request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const { db, role } = await requireMember(id, "member");
+    const { db, role } = await requireMember(id, "staff");
     const desk = await loadDesk(db, id);
     if (!desk) {
       throw new AuthError(404, "Not found");

@@ -9,7 +9,7 @@ type RouteContext = { params: Promise<{ id: string; vendorId: string }> };
 export async function PATCH(request: Request, context: RouteContext) {
   try {
     const { id, vendorId } = await context.params;
-    const { db } = await requireMember(id, "admin");
+    const { db } = await requireMember(id, "manager");
     const body = (await request.json().catch(() => null)) as unknown;
     const result = await updateVendor(db, id, vendorId, body);
     switch (result.kind) {
@@ -29,7 +29,7 @@ export async function PATCH(request: Request, context: RouteContext) {
 export async function DELETE(_request: Request, context: RouteContext) {
   try {
     const { id, vendorId } = await context.params;
-    const { db } = await requireMember(id, "admin");
+    const { db } = await requireMember(id, "manager");
     const result = await archiveVendor(db, id, vendorId);
     if (result.kind === "not-found") {
       return NextResponse.json({ error: "Not found" }, { status: 404 });

@@ -12,7 +12,7 @@ type RouteContext = { params: Promise<{ orderId: string }> };
 export async function POST(request: Request, context: RouteContext) {
   try {
     const { orderId } = await context.params;
-    const { db, userId, workspaceId } = await requireMemberByOrder(orderId, "member");
+    const { db, userId, workspaceId } = await requireMemberByOrder(orderId, "staff");
     const body = (await request.json().catch(() => null)) as unknown;
     const result = await changeOrderStatus(db, { workspaceId, orderId, userId }, body);
     switch (result.kind) {

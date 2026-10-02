@@ -53,6 +53,7 @@ describe("changeOrderStatus", () => {
       text: "Status set to Processing",
       meta: { from: "new", to: "processing" },
       createdAt: NOW,
+      source: "app",
     });
     expect(result.event).toEqual({
       id: event.id,
@@ -62,6 +63,7 @@ describe("changeOrderStatus", () => {
       actorId: USER,
       meta: { from: "new", to: "processing" },
       createdAt: NOW,
+      source: "app",
     });
     expect(result.order).toEqual({
       id: "o1",
@@ -200,6 +202,7 @@ describe("addOrderNote", () => {
       actorId: USER,
       text: "Called the customer.\nShip Monday.",
       createdAt: NOW,
+      source: "app",
     });
     expect(result.event).toEqual({
       id: event.id,
@@ -209,6 +212,7 @@ describe("addOrderNote", () => {
       actorId: USER,
       meta: null,
       createdAt: NOW,
+      source: "app",
     });
   });
 

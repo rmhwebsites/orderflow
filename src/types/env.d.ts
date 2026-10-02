@@ -10,4 +10,9 @@ interface CloudflareEnv {
   VAPID_SUBJECT: string;
   CRON_SECRET: string;
   APP_URL: string;
+  // Bootstrap platform admins, comma separated (case-insensitive). May be
+  // unset at runtime (typed like the other secrets so a .dev.vars entry,
+  // which wrangler types as string, does not conflict); readers treat a
+  // missing value as an empty list (src/server/access.ts).
+  PLATFORM_ADMIN_EMAILS: string;
 }

@@ -691,6 +691,8 @@ describe("runSync", () => {
     const e1001 = newEvents.find((e) => e.orderId === o1001?.id);
     expect(e1001?.text).toBe("New order #1001 from Riley Oakes");
     expect(e1001?.meta).toEqual({ orderName: "#1001" });
+    // New orders come from Shopify (the timeline shows where a change came from).
+    expect(newEvents.map((e) => e.source)).toEqual(["shopify", "shopify", "shopify"]);
 
     const afterFirst = await connectionOf(db, WS);
     expect(afterFirst.lastSyncAt).toBe(NOW);
@@ -1309,6 +1311,7 @@ describe("runSync", () => {
     expect(syncErrors).toHaveLength(1);
     expect(syncErrors[0].text).toBe("Z".repeat(300));
     expect(syncErrors[0].orderId).toBeNull();
+    expect(syncErrors[0].source).toBe("system");
     const connection = await connectionOf(db, WS);
     expect(connection.lastError).toBe("Z".repeat(300));
     expect(connection.lastSyncAt).toBe(0);
@@ -1956,14 +1959,15 @@ describe("runSync", () => {
     expect((await connectionOf(db, WS)).lastSyncAt).toBe(T + 1200000);
   });
 
-  it("runs a whole cursor chain on the schema as of migration 0003", async () => {
-    // The sync engine reads and writes whole store_connections rows, so a
-    // column it needs from a migration that has not been applied yet fails
-    // every run. Migrations 0000 to 0003 are applied locally and remotely;
-    // this pins that the engine needs nothing newer. Raise the number only
-    // together with a deploy note that the newer migration goes out before
-    // the code does.
-    const { db, env } = openDb({ through: "0003" });
+  it("runs a whole cursor chain on the schema as of migration 0004", async () => {
+    // The sync engine reads and writes whole store_connections rows (and
+    // writes events.source), so a column it needs from a migration that has
+    // not been applied yet fails every run. This pins that the engine needs
+    // nothing newer than 0004. Raised from 0003 by the platform phase: DEPLOY
+    // NOTE, run `npm run db:migrate:remote` (applies 0004) BEFORE the code
+    // that needs it reaches production. Raise the number again only together
+    // with a deploy note like this one.
+    const { db, env } = openDb({ through: "0004" });
     await seedWorkspace(db, WS);
     const T = Date.parse("2026-09-25T12:00:00.000Z");
     const previousSync = T - 3600000;

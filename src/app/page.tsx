@@ -1,50 +1,87 @@
 import Link from "next/link";
-import { headers } from "next/headers";
 import { redirect } from "next/navigation";
-import { getDb } from "@/db";
 import { accentStyle } from "@/lib/accent";
 import { APP_NAME } from "@/lib/brand";
-import { getAuth } from "@/server/auth";
-import { listWorkspacesForUser } from "@/server/workspaces";
+import { roleLabel } from "@/lib/roles";
+import { AuthError, requireSession } from "@/server/guard";
+import { hubView } from "@/server/hub";
+import { listWorkspacesForViewer } from "@/server/workspaces";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { ui } from "@/components/ui";
 import { NewWorkspaceForm } from "./new-workspace-form";
+import { SignOutButton } from "./sign-out-button";
 
 // Per-viewer page: never prerender it at build time, where there is no session
 // and getAuth() refuses to run without a deployed APP_URL.
 export const dynamic = "force-dynamic";
 
+// The hub. What it shows depends on the viewer (src/server/hub.ts): a
+// platform admin sees every workspace and the New workspace form; a client
+// with one workspace goes straight into it (the magic link lands here, so
+// that is also what happens right after sign-in); a client with several
+// sees only those; a client with none is told so. Clients never see the
+// create form.
 export default async function Home() {
-  const session = await getAuth().api.getSession({ headers: await headers() });
-  if (!session) {
-    redirect("/sign-in");
+  let guarded: Awaited<ReturnType<typeof requireSession>>;
+  try {
+    guarded = await requireSession();
+  } catch (e) {
+    if (e instanceof AuthError && e.status === 401) {
+      redirect("/sign-in");
+    }
+    throw e;
   }
-  const rows = await listWorkspacesForUser(getDb(), session.user.id);
+  const { db, viewer } = guarded;
+  const view = hubView(viewer, await listWorkspacesForViewer(db, viewer));
+
+  if (view.kind === "redirect") {
+    redirect(view.to);
+  }
+
+  if (view.kind === "no-access") {
+    return (
+      <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center gap-4 px-4 sm:px-6">
+        <p className="text-sm font-medium text-ink-2">{APP_NAME}</p>
+        <h1 className="font-display text-2xl font-semibold tracking-tight">No workspace yet</h1>
+        <p className="text-sm text-ink-2">
+          You do not have access to a workspace yet. Ask your manager to invite you.
+        </p>
+        <p className="break-words text-sm text-ink-2">Signed in as {viewer.email}</p>
+        <div className="mt-2">
+          <SignOutButton />
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="mx-auto flex min-h-dvh max-w-xl flex-col gap-10 px-4 py-10 sm:px-6 sm:py-14">
       <header className="flex items-start justify-between gap-4">
-        <div>
+        <div className="min-w-0">
           <h1 className="font-display text-2xl font-semibold tracking-tight">{APP_NAME}</h1>
-          <p className="mt-1 text-sm text-ink-2">Signed in as {session.user.email}</p>
+          <p className="mt-1 break-words text-sm text-ink-2">Signed in as {viewer.email}</p>
+          {viewer.platformAdmin ? (
+            <p className="mt-1 text-xs font-semibold text-ink-2">{roleLabel("platform")}</p>
+          ) : null}
         </div>
-        <ThemeToggle />
+        <div className="flex shrink-0 items-center gap-2">
+          <ThemeToggle />
+          <SignOutButton />
+        </div>
       </header>
 
       <section aria-labelledby="workspaces-heading" className="flex flex-col gap-3">
         <h2 id="workspaces-heading" className="font-display text-base font-semibold">
-          Your workspaces
+          {view.canCreate ? "All workspaces" : "Your workspaces"}
         </h2>
-        {rows.length === 0 ? (
-          <p className={`${ui.panel} px-4 py-5 text-sm text-ink-2`}>
-            No workspaces yet. Create one below, then connect its Shopify store in Settings.
-          </p>
+        {view.workspaces.length === 0 ? (
+          <p className={`${ui.panel} px-4 py-5 text-sm text-ink-2`}>No workspaces yet. Create one below.</p>
         ) : (
           <ul className="flex flex-col gap-2">
-            {rows.map((workspace) => (
+            {view.workspaces.map((workspace) => (
               <li key={workspace.id} style={accentStyle(workspace.accentColor)} data-accent-scope>
                 <Link
-                  href={`/w/${workspace.slug}`}
+                  href={`/w/${encodeURIComponent(workspace.slug)}`}
                   className={`${ui.panel} flex items-center gap-3 px-4 py-3 transition-colors hover:border-accent-strong`}
                 >
                   <span
@@ -53,8 +90,10 @@ export default async function Home() {
                   >
                     {workspace.name.trim().charAt(0).toUpperCase()}
                   </span>
-                  <span className="flex-1 font-medium">{workspace.name}</span>
-                  <span className="text-xs font-medium capitalize text-ink-2">{workspace.role}</span>
+                  <span className="min-w-0 flex-1 truncate font-medium">{workspace.name}</span>
+                  {workspace.role === "platform" ? null : (
+                    <span className="text-xs font-medium text-ink-2">{roleLabel(workspace.role)}</span>
+                  )}
                 </Link>
               </li>
             ))}
@@ -62,12 +101,14 @@ export default async function Home() {
         )}
       </section>
 
-      <section aria-labelledby="new-workspace-heading" className="flex flex-col gap-3">
-        <h2 id="new-workspace-heading" className="font-display text-base font-semibold">
-          New workspace
-        </h2>
-        <NewWorkspaceForm />
-      </section>
+      {view.canCreate ? (
+        <section aria-labelledby="new-workspace-heading" className="flex flex-col gap-3">
+          <h2 id="new-workspace-heading" className="font-display text-base font-semibold">
+            New workspace
+          </h2>
+          <NewWorkspaceForm />
+        </section>
+      ) : null}
     </main>
   );
 }

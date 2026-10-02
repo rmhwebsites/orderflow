@@ -31,7 +31,14 @@ export type SettingsPayload = {
 export type UpdateSettingsResult =
   | { kind: "invalid"; error: string }
   | { kind: "not-found" }
+  // A field the caller's role may not change (the route answers 404).
+  | { kind: "forbidden" }
   | ({ kind: "ok" } & SettingsPayload);
+
+// canEditIdentity: the workspace's name and accent color (its branding) are
+// platform-admin settings (platform amendment section 2); managers change
+// the notification list, reply-to, from name and PO prefix.
+export type SettingsAccess = { canEditIdentity: boolean };
 
 type WorkspacePatch = { name?: string; accentColor?: string };
 type SettingsPatch = {
@@ -134,16 +141,21 @@ export async function getWorkspaceSettings(
   return { workspace, settings: settingsView(settingsRows[0]) };
 }
 
-// Partial update: only the fields present change. The workspace row and the
+// Partial update: only the fields present change; any field the caller may
+// not change refuses the whole update. The workspace row and the
 // settings row are written in one batch; the slug never changes.
 export async function updateWorkspaceSettings(
   db: Db,
   workspaceId: string,
   body: unknown,
+  access: SettingsAccess,
 ): Promise<UpdateSettingsResult> {
   const patch = parsePatch(body);
   if (typeof patch === "string") {
     return { kind: "invalid", error: patch };
+  }
+  if (!access.canEditIdentity && Object.keys(patch.workspace).length > 0) {
+    return { kind: "forbidden" };
   }
   const found = await db
     .select({ id: workspaces.id })

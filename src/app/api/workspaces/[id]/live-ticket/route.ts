@@ -10,7 +10,7 @@ type RouteContext = { params: Promise<{ id: string }> };
 export async function GET(_request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const { userId } = await requireMember(id, "member");
+    const { userId } = await requireMember(id, "staff");
     const { env } = getCloudflareContext();
     const { ticket, expiresAt } = await signLiveTicket(
       { workspaceId: id, userId },

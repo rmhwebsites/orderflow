@@ -10,7 +10,7 @@ type RouteContext = { params: Promise<{ id: string }> };
 export async function GET(request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const { db } = await requireMember(id, "member");
+    const { db } = await requireMember(id, "staff");
     const orderId = new URL(request.url).searchParams.get("orderId");
     const result = await listEvents(db, id, orderId);
     if (result.kind === "not-found") {

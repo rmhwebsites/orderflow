@@ -32,6 +32,7 @@ const noteEvent: LiveEvent = {
     actorId: "u1",
     meta: null,
     createdAt: 1,
+    source: "app",
   },
 };
 

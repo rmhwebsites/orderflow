@@ -313,6 +313,7 @@ describe("listEvents", () => {
       type: "sync_error" as const,
       text: "event " + i,
       createdAt: 1000 + i,
+      source: "system" as const,
     }));
     for (let i = 0; i < rows.length; i += 100) {
       await db.insert(schema.events).values(rows.slice(i, i + 100));
@@ -331,6 +332,7 @@ describe("listEvents", () => {
         actorId: null,
         meta: null,
         createdAt: 1300,
+        source: "system",
       });
       expect(result.events[EVENT_FEED_CAP - 1].id).toBe("e001");
       expect(result.events.map((e) => e.id)).not.toContain("other_newest");

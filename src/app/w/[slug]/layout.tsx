@@ -25,7 +25,7 @@ export default async function WorkspaceLayout({
   const { slug } = await params;
   let guarded: Awaited<ReturnType<typeof requireMemberBySlug>>;
   try {
-    guarded = await requireMemberBySlug(slug, "member");
+    guarded = await requireMemberBySlug(slug, "staff");
   } catch (e) {
     if (e instanceof AuthError) {
       if (e.status === 401) {

@@ -6,3 +6,6 @@ VAPID_PRIVATE_KEY=
 VAPID_SUBJECT=mailto:ryan@rmhwebsites.com
 CRON_SECRET=generate-with-openssl-rand-hex-16
 APP_URL=http://localhost:3000
+# Bootstrap platform admins, comma separated. Sign-up is closed, so locally
+# put your own address here or no sign-in link is sent.
+PLATFORM_ADMIN_EMAILS=you@example.com

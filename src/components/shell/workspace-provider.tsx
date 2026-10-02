@@ -51,7 +51,7 @@ export function useWorkspace(): WorkspaceContextValue {
 
 const SKIP_MESSAGES: Record<NonNullable<SyncResult["skipped"]>, string> = {
   running: "A sync is already running. New orders will appear here when it finishes.",
-  "no-connection": "Connect a Shopify store in Settings before syncing.",
+  "no-connection": "No Shopify store is connected to this workspace yet.",
   disabled: "Sync is paused for this store.",
 };
 

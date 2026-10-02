@@ -40,7 +40,8 @@ export function SyncBanner() {
           <span className="break-words">{detail}</span>
           {failure ? landed(failure.added, failure.updated) : null}
         </p>
-        {SETTINGS_PAGE_AVAILABLE && roleAtLeast(role, "admin") ? (
+        {/* The store connection is a platform-admin setting. */}
+        {SETTINGS_PAGE_AVAILABLE && roleAtLeast(role, "platform") ? (
           <Link
             href={`/w/${workspace.slug}/settings`}
             className="shrink-0 font-semibold underline decoration-1 underline-offset-2 hover:decoration-2"

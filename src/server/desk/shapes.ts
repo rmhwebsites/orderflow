@@ -19,6 +19,8 @@ export type EventView = {
   actorId: string | null;
   meta: unknown;
   createdAt: number;
+  // Where the change came from: a person in the app, Shopify, or the system.
+  source: (typeof events.$inferSelect)["source"];
 };
 
 export type SettingsView = {
@@ -51,6 +53,7 @@ export function eventView(row: typeof events.$inferSelect): EventView {
     actorId: row.actorId,
     meta: row.meta ?? null,
     createdAt: row.createdAt,
+    source: row.source,
   };
 }
 

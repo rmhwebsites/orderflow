@@ -11,7 +11,7 @@ type RouteContext = { params: Promise<{ id: string }> };
 export async function GET(_request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const { db } = await requireMember(id, "member");
+    const { db } = await requireMember(id, "staff");
     return NextResponse.json({ connection: await getSyncConnection(db, id) });
   } catch (e) {
     return guardResponse(e);
@@ -24,7 +24,7 @@ export async function GET(_request: Request, context: RouteContext) {
 export async function POST(_request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const { db } = await requireMember(id, "member");
+    const { db } = await requireMember(id, "staff");
     const { env, ctx } = getCloudflareContext();
     const outcome = await manualSync(db, env, id);
     if (outcome.kind !== "cooldown") {

@@ -90,6 +90,7 @@ export async function changeOrderStatus(
     actorId: ctx.userId,
     meta: { from: order.statusKey, to: statusKey },
     createdAt: now,
+    source: "app" as const,
   };
   // The status was read above, but replaceStatuses may remove it before
   // this write lands. Both statements therefore re-check in SQL that it
@@ -105,11 +106,12 @@ export async function changeOrderStatus(
       .where(
         and(eq(orders.id, order.id), eq(orders.workspaceId, ctx.workspaceId), statusStillExists),
       ),
-    // Values in the events table's column order.
+    // Values in the events table's column order (schema.ts declares the
+    // columns in that order; drizzle names them all in the insert).
     db
       .insert(events)
       .select(
-        sql`select ${event.id}, ${event.workspaceId}, ${event.orderId}, ${event.type}, ${event.text}, ${event.actorId}, ${JSON.stringify(event.meta)}, ${event.createdAt} where ${statusStillExists}`,
+        sql`select ${event.id}, ${event.workspaceId}, ${event.orderId}, ${event.type}, ${event.text}, ${event.actorId}, ${JSON.stringify(event.meta)}, ${event.createdAt}, ${event.source} where ${statusStillExists}`,
       ),
   ]);
   if (rowsAffected(updateResult, "desk") === 0) {
@@ -151,6 +153,7 @@ export async function addOrderNote(
     actorId: ctx.userId,
     meta: null,
     createdAt: ctx.now ?? Date.now(),
+    source: "app" as const,
   };
   await db.insert(events).values(event);
   return { kind: "added", event: eventView(event) };

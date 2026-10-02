@@ -46,6 +46,7 @@ function timelineEvent(id: string, overrides: Partial<EventView> = {}): EventVie
     actorId: MARTA,
     meta: null,
     createdAt: 5000,
+    source: "app",
     ...overrides,
   };
 }

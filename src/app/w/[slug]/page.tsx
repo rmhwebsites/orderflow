@@ -17,7 +17,7 @@ export default async function WorkspacePage({
 }) {
   const { slug } = await params;
   try {
-    await requireMemberBySlug(slug, "member");
+    await requireMemberBySlug(slug, "staff");
   } catch (e) {
     if (e instanceof AuthError) {
       if (e.status === 401) {

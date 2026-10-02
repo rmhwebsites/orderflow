@@ -9,7 +9,7 @@ type RouteContext = { params: Promise<{ orderId: string }> };
 export async function GET(_request: Request, context: RouteContext) {
   try {
     const { orderId } = await context.params;
-    const { db, workspaceId } = await requireMemberByOrder(orderId, "member");
+    const { db, workspaceId } = await requireMemberByOrder(orderId, "staff");
     const detail = await getOrderDetail(db, workspaceId, orderId);
     if (!detail) {
       throw new AuthError(404, "Not found");

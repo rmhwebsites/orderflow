@@ -1,6 +1,6 @@
 // Minimal local declarations for better-sqlite3: the package ships no types and
 // @types/better-sqlite3 is intentionally not installed (no new dependencies).
-// Covers only the surface used by src/db/schema.test.ts.
+// Covers only the surface the tests use.
 declare module "better-sqlite3" {
   class Statement {
     run(...params: Array<string | number | bigint | null>): {
@@ -8,6 +8,7 @@ declare module "better-sqlite3" {
       lastInsertRowid: number | bigint;
     };
     all(...params: Array<string | number | bigint | null>): unknown[];
+    get(...params: Array<string | number | bigint | null>): unknown;
   }
   class Database {
     constructor(filename: string, options?: { readonly?: boolean });

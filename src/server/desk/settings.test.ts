@@ -7,6 +7,9 @@ import { openTestDb, seedWorkspace, withBatch } from "./test-helpers";
 
 const WS = "ws_impact";
 const OTHER = "ws_other";
+// The route passes canEditIdentity: true only for platform admins.
+const PLATFORM = { canEditIdentity: true };
+const MANAGER = { canEditIdentity: false };
 
 async function setup() {
   const { db } = openTestDb();
@@ -23,7 +26,7 @@ async function snapshotRows(db: Db) {
 }
 
 async function updated(db: Db, body: Record<string, unknown>) {
-  const result = await updateWorkspaceSettings(db, WS, body);
+  const result = await updateWorkspaceSettings(db, WS, body, PLATFORM);
   if (result.kind !== "ok") {
     throw new Error("expected ok, got " + JSON.stringify(result));
   }
@@ -67,7 +70,7 @@ describe("updateWorkspaceSettings", () => {
     const result = await updateWorkspaceSettings(withBatch(db, batched), WS, {
       name: "IMPACT",
       poPrefix: "IMP",
-    });
+    }, PLATFORM);
     expect(result.kind).toBe("ok");
     expect(batched).toHaveLength(1);
     expect(batched[0]).toHaveLength(2);
@@ -77,7 +80,7 @@ describe("updateWorkspaceSettings", () => {
     const db = await setup();
     expect((await updated(db, { name: "n".repeat(80) })).workspace.name).toHaveLength(80);
     for (const name of ["", "   ", "n".repeat(81), 7, null]) {
-      expect((await updateWorkspaceSettings(db, WS, { name })).kind, String(name)).toBe("invalid");
+      expect((await updateWorkspaceSettings(db, WS, { name }, PLATFORM)).kind, String(name)).toBe("invalid");
     }
   });
 
@@ -100,7 +103,7 @@ describe("updateWorkspaceSettings", () => {
       null,
       123456,
     ]) {
-      const result = await updateWorkspaceSettings(db, WS, { accentColor });
+      const result = await updateWorkspaceSettings(db, WS, { accentColor }, PLATFORM);
       expect(result.kind, JSON.stringify(accentColor)).toBe("invalid");
     }
     expect(await snapshotRows(db)).toEqual(before);
@@ -122,7 +125,7 @@ describe("updateWorkspaceSettings", () => {
       "desk@impact.example",
       null,
     ]) {
-      const outcome = await updateWorkspaceSettings(db, WS, { notificationEmails });
+      const outcome = await updateWorkspaceSettings(db, WS, { notificationEmails }, PLATFORM);
       expect(outcome.kind, JSON.stringify(notificationEmails)?.slice(0, 60)).toBe("invalid");
     }
   });
@@ -132,7 +135,7 @@ describe("updateWorkspaceSettings", () => {
     expect((await updated(db, { poPrefix: " imp2 " })).settings.poPrefix).toBe("IMP2");
     expect((await updated(db, { poPrefix: "ABCDEFGH" })).settings.poPrefix).toBe("ABCDEFGH");
     for (const poPrefix of ["", "ABCDEFGHI", "IM-P", "IM P", "PO_1", "ÉP", null, 12]) {
-      const result = await updateWorkspaceSettings(db, WS, { poPrefix });
+      const result = await updateWorkspaceSettings(db, WS, { poPrefix }, PLATFORM);
       expect(result.kind, JSON.stringify(poPrefix)).toBe("invalid");
     }
   });
@@ -146,7 +149,7 @@ describe("updateWorkspaceSettings", () => {
     await updated(db, { replyTo: "ops@impact.example" });
     expect((await updated(db, { replyTo: "  " })).settings.replyTo).toBeNull();
     for (const replyTo of ["not-an-email", "a@b.com, c@d.com", 5]) {
-      const result = await updateWorkspaceSettings(db, WS, { replyTo });
+      const result = await updateWorkspaceSettings(db, WS, { replyTo }, PLATFORM);
       expect(result.kind, JSON.stringify(replyTo)).toBe("invalid");
     }
   });
@@ -181,7 +184,7 @@ describe("updateWorkspaceSettings", () => {
       "Tab\tName",
       42,
     ]) {
-      const result = await updateWorkspaceSettings(db, WS, { fromName });
+      const result = await updateWorkspaceSettings(db, WS, { fromName }, PLATFORM);
       expect(result.kind, JSON.stringify(fromName)).toBe("invalid");
     }
     expect(await snapshotRows(db)).toEqual(before);
@@ -194,7 +197,7 @@ describe("updateWorkspaceSettings", () => {
       name: "Perfectly Fine",
       poPrefix: "IMP",
       accentColor: "javascript:alert(1)",
-    });
+    }, PLATFORM);
     expect(result.kind).toBe("invalid");
     expect(await snapshotRows(db)).toEqual(before);
   });
@@ -202,7 +205,7 @@ describe("updateWorkspaceSettings", () => {
   it("rejects a body with no known fields", async () => {
     const db = await setup();
     for (const body of [{}, { slug: "renamed" }, null, "name", []]) {
-      expect((await updateWorkspaceSettings(db, WS, body)).kind, JSON.stringify(body)).toBe(
+      expect((await updateWorkspaceSettings(db, WS, body, PLATFORM)).kind, JSON.stringify(body)).toBe(
         "invalid",
       );
     }
@@ -210,8 +213,35 @@ describe("updateWorkspaceSettings", () => {
 
   it("is not-found for a workspace that does not exist", async () => {
     const db = await setup();
-    expect(await updateWorkspaceSettings(db, "ws_missing", { name: "Ghost" })).toEqual({
+    expect(await updateWorkspaceSettings(db, "ws_missing", { name: "Ghost" }, PLATFORM)).toEqual({
       kind: "not-found",
+    });
+  });
+
+  // Branding (the accent color) and the workspace's name are platform-admin
+  // settings; managers keep the notification and PO settings.
+  it("refuses a manager's change to the name or accent color, and changes nothing", async () => {
+    const db = await setup();
+    const before = await snapshotRows(db);
+    for (const body of [{ name: "Renamed" }, { accentColor: "#ff0000" }, { name: "Renamed", poPrefix: "IMP" }]) {
+      expect(await updateWorkspaceSettings(db, WS, body, MANAGER), JSON.stringify(body)).toEqual({
+        kind: "forbidden",
+      });
+    }
+    expect(await snapshotRows(db)).toEqual(before);
+  });
+
+  it("lets a manager change notification, reply-to, from name and PO settings", async () => {
+    const db = await setup();
+    const result = await updateWorkspaceSettings(
+      db,
+      WS,
+      { notificationEmails: ["ops@example.com"], replyTo: "ops@example.com", fromName: "IMPACT", poPrefix: "imp" },
+      MANAGER,
+    );
+    expect(result).toMatchObject({
+      kind: "ok",
+      settings: { notificationEmails: ["ops@example.com"], replyTo: "ops@example.com", fromName: "IMPACT", poPrefix: "IMP" },
     });
   });
 

@@ -8,7 +8,7 @@ type RouteContext = { params: Promise<{ id: string }> };
 export async function GET(_request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const { db } = await requireMember(id, "member");
+    const { db } = await requireMember(id, "staff");
     return NextResponse.json({ vendors: await listVendors(db, id) });
   } catch (e) {
     return guardResponse(e);
@@ -19,7 +19,7 @@ export async function GET(_request: Request, context: RouteContext) {
 export async function POST(request: Request, context: RouteContext) {
   try {
     const { id } = await context.params;
-    const { db } = await requireMember(id, "admin");
+    const { db } = await requireMember(id, "manager");
     const body = (await request.json().catch(() => null)) as unknown;
     const result = await createVendor(db, id, body);
     if (result.kind === "invalid") {

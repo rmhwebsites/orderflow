@@ -2,9 +2,11 @@ import { cache } from "react";
 import { and, eq } from "drizzle-orm";
 import { headers } from "next/headers";
 import { NextResponse } from "next/server";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { getDb, type Db } from "@/db";
 import { orders, workspaceMembers, workspaces } from "@/db/schema";
 import { roleAtLeast, type Role } from "@/lib/roles";
+import { isPlatformAdmin } from "./access";
 import { getAuth } from "./auth";
 
 export { roleAtLeast, type Role };
@@ -19,59 +21,99 @@ export class AuthError extends Error {
   }
 }
 
-// Session guard for routes that are not workspace-scoped (listing and
-// creating workspaces). 401 without a session.
+// Who is asking. platformAdmin is the effective flag (bootstrap list or
+// promoted, see src/server/access.ts).
+export type Viewer = { userId: string; email: string; platformAdmin: boolean };
+
+const notFound = () => new AuthError(404, "Not found");
+
+// Session guard. 401 without a session. Every other guard builds on it.
 export async function requireSession() {
   const session = await getAuth().api.getSession({ headers: await headers() });
   if (!session) {
     throw new AuthError(401, "Not signed in");
   }
-  return { userId: session.user.id, db: getDb(), session };
+  const db = getDb();
+  const { env } = getCloudflareContext();
+  const viewer: Viewer = {
+    userId: session.user.id,
+    email: session.user.email,
+    platformAdmin: await isPlatformAdmin(db, env, session.user.id, session.user.email),
+  };
+  return { ...viewer, viewer, db, session, env };
 }
 
-// The caller's role in the workspace, or a 404 when there is no membership
-// or the role is under-ranked.
-async function memberRole(
+// 404 (never 403) for anyone who is not a platform admin, so platform-only
+// routes look exactly like missing ones.
+export function assertPlatformAdmin(viewer: Viewer): void {
+  if (!viewer.platformAdmin) {
+    throw notFound();
+  }
+}
+
+// Platform-admin-only operations: workspace creation, store connection,
+// branding, custom domain, email sender, promoting platform admins.
+export async function requirePlatformAdmin() {
+  const guarded = await requireSession();
+  assertPlatformAdmin(guarded.viewer);
+  return guarded;
+}
+
+// The caller's effective role in the workspace, or a 404.
+// - A platform admin gets "platform" in every workspace that exists (ranked
+//   above manager, so every check passes), whether or not they are a member.
+// - Anyone else needs a membership whose role is at least `required`.
+// A missing workspace, a non-member and an under-ranked member all get the
+// same 404, so nobody can tell "exists but forbidden" from "does not exist".
+// Pass knownToExist when the caller has just read the workspace row.
+export async function resolveWorkspaceRole(
   db: Db,
+  viewer: Viewer,
   workspaceId: string,
-  userId: string,
   required: Role,
+  knownToExist = false,
 ): Promise<Role> {
+  if (viewer.platformAdmin) {
+    if (!knownToExist) {
+      const rows = await db
+        .select({ id: workspaces.id })
+        .from(workspaces)
+        .where(eq(workspaces.id, workspaceId))
+        .limit(1);
+      if (rows.length === 0) {
+        throw notFound();
+      }
+    }
+    return "platform";
+  }
   const rows = await db
-    .select()
+    .select({ role: workspaceMembers.role })
     .from(workspaceMembers)
-    .where(
-      and(
-        eq(workspaceMembers.workspaceId, workspaceId),
-        eq(workspaceMembers.userId, userId),
-      ),
-    )
+    .where(and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, viewer.userId)))
     .limit(1);
   const membership = rows[0];
   if (!membership || !roleAtLeast(membership.role, required)) {
-    throw new AuthError(404, "Not found");
+    throw notFound();
   }
   return membership.role;
 }
 
-// Membership guard for workspace-scoped routes. 401 without a session; 404
-// both when the workspace has no membership for the user and when the role is
-// under-ranked, so a non-member cannot distinguish "exists but forbidden"
-// from "does not exist".
+// Guard for workspace-scoped routes: 401 without a session, then
+// resolveWorkspaceRole.
 export async function requireMember(workspaceId: string, required: Role) {
-  const { userId, db, session } = await requireSession();
-  const role = await memberRole(db, workspaceId, userId, required);
-  return { userId, role, db, session };
+  const guarded = await requireSession();
+  const role = await resolveWorkspaceRole(guarded.db, guarded.viewer, workspaceId, required);
+  return { ...guarded, role };
 }
 
 // The db-taking core of requireMemberByOrder: resolves the order's
-// workspace, then applies the membership rule above. A missing order and a
+// workspace, then applies the workspace rule above. A missing order and a
 // non-member (or under-ranked) caller get the same 404, so order ids reveal
 // nothing to outsiders.
 export async function resolveOrderAccess(
   db: Db,
   orderId: string,
-  userId: string,
+  viewer: Viewer,
   required: Role,
 ): Promise<{ role: Role; workspaceId: string }> {
   const rows = await db
@@ -81,18 +123,19 @@ export async function resolveOrderAccess(
     .limit(1);
   const order = rows[0];
   if (!order) {
-    throw new AuthError(404, "Not found");
+    throw notFound();
   }
-  const role = await memberRole(db, order.workspaceId, userId, required);
+  // The order's foreign key guarantees its workspace exists.
+  const role = await resolveWorkspaceRole(db, viewer, order.workspaceId, required, true);
   return { role, workspaceId: order.workspaceId };
 }
 
 // Guard for order-scoped routes (/api/orders/[orderId]/...): 401 without a
 // session first, then resolveOrderAccess.
 export async function requireMemberByOrder(orderId: string, required: Role) {
-  const { userId, db, session } = await requireSession();
-  const { role, workspaceId } = await resolveOrderAccess(db, orderId, userId, required);
-  return { userId, role, db, session, workspaceId };
+  const guarded = await requireSession();
+  const { role, workspaceId } = await resolveOrderAccess(guarded.db, orderId, guarded.viewer, required);
+  return { ...guarded, role, workspaceId };
 }
 
 // Guard for /w/[slug] server components. EVERY server component under
@@ -102,18 +145,14 @@ export async function requireMemberByOrder(orderId: string, required: Role) {
 // cache() dedupes the session and membership queries across the components
 // of one request.
 export const requireMemberBySlug = cache(async (slug: string, required: Role) => {
-  const db = getDb();
-  const rows = await db
-    .select()
-    .from(workspaces)
-    .where(eq(workspaces.slug, slug))
-    .limit(1);
+  const guarded = await requireSession();
+  const rows = await guarded.db.select().from(workspaces).where(eq(workspaces.slug, slug)).limit(1);
   const workspace = rows[0];
   if (!workspace) {
-    throw new AuthError(404, "Not found");
+    throw notFound();
   }
-  const { userId, role, session } = await requireMember(workspace.id, required);
-  return { workspace, userId, role, db, session };
+  const role = await resolveWorkspaceRole(guarded.db, guarded.viewer, workspace.id, required, true);
+  return { ...guarded, workspace, role };
 });
 
 export function guardResponse(e: unknown): NextResponse {
