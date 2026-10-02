@@ -4,6 +4,7 @@
 
 import { and, asc, desc, eq, inArray, lt, lte } from "drizzle-orm";
 import type { Db } from "../../db";
+import { applyBatch } from "../../db/batch";
 import { events, orders, statuses, storeConnections } from "../../db/schema";
 import { decryptSecret } from "../crypto";
 import { fetchOrdersUpdatedSince } from "../shopify/client";
@@ -75,23 +76,16 @@ function changesOf(result: unknown): number {
   return 1;
 }
 
-// Two statements that must land together. db.batch is the atomic path on D1;
-// the better-sqlite3-backed Db injected by tests has no batch method, so fall
-// back to sequential awaits (drizzle builders are thenables that run on await).
-// Returns the per-statement results so callers can read rows-affected.
-// Exported for its own unit tests.
+// Two statements that must land together: db.batch on D1 (atomic), sequential
+// awaits on the better-sqlite3 test driver. A two-statement applyBatch (see
+// src/db/batch.ts for the semantics); returns the per-statement results so
+// callers can read rows-affected. Exported for its own unit tests.
 export async function applyPair(
   db: Db,
   a: PromiseLike<unknown>,
   b: PromiseLike<unknown>,
 ): Promise<unknown[]> {
-  const batchable = db as unknown as {
-    batch?: (statements: [PromiseLike<unknown>, PromiseLike<unknown>]) => Promise<unknown[]>;
-  };
-  if (typeof batchable.batch === "function") {
-    return await batchable.batch([a, b]);
-  }
-  return [await a, await b];
+  return applyBatch(db, [a, b]);
 }
 
 type ConnectionWrite = Partial<typeof storeConnections.$inferInsert>;

@@ -1,0 +1,139 @@
+// Write side of the desk: status changes and notes. Each write produces an
+// activity event, returned so the route can hand it to the realtime layer.
+// Callers authorize first (requireMemberByOrder); every query here is still
+// scoped to the workspace it is given.
+
+import { and, eq } from "drizzle-orm";
+import type { Db } from "@/db";
+import { applyBatch } from "@/db/batch";
+import { events, orders, statuses } from "@/db/schema";
+import { eventView, isRecord, type EventView } from "./shapes";
+
+// Matches the 4000 a note textarea's maxLength counts (UTF-16 code units).
+export const NOTE_MAX = 4000;
+
+export type MutationContext = {
+  workspaceId: string;
+  orderId: string;
+  userId: string;
+  // Injectable clock for tests.
+  now?: number;
+};
+
+export type StatusChangeResult =
+  | { kind: "invalid"; error: string }
+  | { kind: "not-found" }
+  | { kind: "unchanged" }
+  | {
+      kind: "changed";
+      event: EventView;
+      order: { id: string; statusKey: string; statusSetBy: string; statusSetAt: number };
+      triggersPo: boolean;
+    };
+
+export type NoteResult =
+  | { kind: "invalid"; error: string }
+  | { kind: "not-found" }
+  | { kind: "added"; event: EventView };
+
+async function findOrder(db: Db, ctx: MutationContext) {
+  const rows = await db
+    .select({ id: orders.id, statusKey: orders.statusKey })
+    .from(orders)
+    .where(and(eq(orders.id, ctx.orderId), eq(orders.workspaceId, ctx.workspaceId)))
+    .limit(1);
+  return rows[0];
+}
+
+// Sets an order's status. The order update and its "status" event go out in
+// one batch, so on D1 neither lands without the other. Only the team's own
+// columns change (statusKey, statusSetBy, statusSetAt): the Shopify snapshot
+// and synced_at belong to the sync engine. Concurrent changes resolve last
+// writer wins; each one still leaves its own event.
+export async function changeOrderStatus(
+  db: Db,
+  ctx: MutationContext,
+  body: unknown,
+): Promise<StatusChangeResult> {
+  const statusKey = isRecord(body) ? body.statusKey : undefined;
+  if (typeof statusKey !== "string" || statusKey.length === 0) {
+    return { kind: "invalid", error: "statusKey is required" };
+  }
+
+  const [order, statusRows] = await Promise.all([
+    findOrder(db, ctx),
+    db
+      .select({ label: statuses.label, triggersPo: statuses.triggersPo })
+      .from(statuses)
+      .where(and(eq(statuses.workspaceId, ctx.workspaceId), eq(statuses.key, statusKey)))
+      .limit(1),
+  ]);
+  if (!order) {
+    return { kind: "not-found" };
+  }
+  const status = statusRows[0];
+  if (!status) {
+    return { kind: "invalid", error: "Unknown status for this workspace" };
+  }
+  if (order.statusKey === statusKey) {
+    return { kind: "unchanged" };
+  }
+
+  const now = ctx.now ?? Date.now();
+  const event = {
+    id: crypto.randomUUID(),
+    workspaceId: ctx.workspaceId,
+    orderId: order.id,
+    type: "status" as const,
+    text: `Status set to ${status.label}`,
+    actorId: ctx.userId,
+    meta: { from: order.statusKey, to: statusKey },
+    createdAt: now,
+  };
+  await applyBatch(db, [
+    db
+      .update(orders)
+      .set({ statusKey, statusSetBy: ctx.userId, statusSetAt: now })
+      .where(and(eq(orders.id, order.id), eq(orders.workspaceId, ctx.workspaceId))),
+    db.insert(events).values(event),
+  ]);
+
+  return {
+    kind: "changed",
+    event: eventView(event),
+    order: { id: order.id, statusKey, statusSetBy: ctx.userId, statusSetAt: now },
+    triggersPo: status.triggersPo,
+  };
+}
+
+// Adds a note to an order's timeline. The text is trimmed; 1 to NOTE_MAX
+// characters after trimming. Line breaks inside are kept.
+export async function addOrderNote(
+  db: Db,
+  ctx: MutationContext,
+  body: unknown,
+): Promise<NoteResult> {
+  const raw = isRecord(body) ? body.text : undefined;
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (text.length === 0 || text.length > NOTE_MAX) {
+    return { kind: "invalid", error: `A note must be 1 to ${NOTE_MAX} characters` };
+  }
+
+  const order = await findOrder(db, ctx);
+  if (!order) {
+    return { kind: "not-found" };
+  }
+
+  const event = {
+    id: crypto.randomUUID(),
+    workspaceId: ctx.workspaceId,
+    orderId: order.id,
+    type: "note" as const,
+    text,
+    actorId: ctx.userId,
+    meta: null,
+    createdAt: ctx.now ?? Date.now(),
+  };
+  await db.insert(events).values(event);
+  return { kind: "added", event: eventView(event) };
+}
