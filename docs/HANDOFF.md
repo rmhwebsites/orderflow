@@ -370,3 +370,38 @@ Supersedes the 798 point figure and the old line item limit above.
   with SVG sanitizing + PNG copies for email, disconnect-as-disable).
 - A separate user-started session ("Surface orders with more than 50 line
   items") also commits to this branch; check git log before committing.
+
+## STATE UPDATE, 2026-10-02 rename (supersedes conflicting notes above)
+
+- Product name is now **Ordering Desk** (domain orderingdesk.com). GitHub repo
+  renamed to rmhwebsites/orderingdesk (origin updated). Cloudflare Worker
+  renamed to `orderingdesk` (same Worker as orderflow, secrets carried over).
+- LIVE at https://orderingdesk.com (Worker custom domain). Hotfix deployed from
+  f6af440 via a temp worktree with UNCOMMITTED config: name orderingdesk,
+  APP_URL https://orderingdesk.com, EMAIL_FROM "Ordering Desk
+  <orders@orderingdesk.com>", routes [{pattern orderingdesk.com,
+  custom_domain true}]. workers.dev is now disabled (routes present).
+- PENDING RENAME COMMIT (do right after the Phase 5 workflow finishes, because
+  its reviewers check the old names): src/lib/brand.ts APP_NAME "Ordering
+  Desk"; send.ts DEFAULT_FROM -> orders@orderingdesk.com (+ send.test.ts);
+  wrangler.jsonc as above plus "preview_urls": true so Workers Builds branch
+  previews keep working; globals.css comment; theme storage key and live
+  ticket purpose strings may move to ordering-desk (internal). R2 bucket
+  `orderflow` and D1 `order_desk` keep their names (internal resources).
+- Email: production now fails with "could not find domain config of sending
+  domain" until Ryan onboards orderingdesk.com under Email Service > Email
+  Sending (orderingdesk.com has no MX, so it is clean).
+- Workers Builds: commands set by Ryan, repo connected. Production branch
+  presumed main (unconfirmed). Merge build/m1-core into main only after: the
+  rename commit, `npm run db:migrate:remote` (Phase 5 adds a branding
+  column), and a passing build. Builds does not run migrations.
+- Next feature after Phase 5: client custom domains (orders.<client domain>).
+  Plan: workspaces.customDomain; host -> workspace resolution (client host
+  opens that workspace directly, branded); better-auth baseURL and trusted
+  origins per allowed host (cookies are per host, sign-in happens on the
+  client host); emails link to the workspace host, sent from the platform
+  domain with the workspace name. Infra: orders.impactrentals.store can be a
+  Worker custom domain (same account); external clients via Cloudflare for
+  SaaS custom hostnames on the orderingdesk.com zone (client CNAME).
+- Stray Worker `order-desk` still exists (shares D1); awaiting Ryan's OK to
+  delete.
