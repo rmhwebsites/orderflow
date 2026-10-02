@@ -55,28 +55,32 @@ const REQUEST_TIMEOUT_MS = 90000;
 // and everything selected under a connection is multiplied by its page size.
 // One order therefore costs 10 points (the order, two price sets of two
 // objects each, customer, shipping address, the line item connection and its
-// pageInfo) plus 3 per line item slot (the item and its price set), which
-// makes orders x line items the whole budget. Five orders of up to 49 line
-// items request 3 + 5 x 157 = 788; a 50th slot would make it 803.
-// client.test.ts prices the query that is actually sent and fails above 800,
-// and raising either number means lowering the other. An order with more
-// line items keeps its first 49 and is stored with itemsTruncated set (from
-// the line item pageInfo, see normalize.ts), so nothing built from the
-// snapshot can mistake it for the whole order.
+// pageInfo), 5 for its fulfillment list (3 slots; a sized list of objects is
+// not a connection and Shopify does not document its price, so client.test.ts
+// prices it like one, which can only overstate it), plus 3 per line item slot
+// (the item and its price set), which makes orders x line items the whole
+// budget. Five orders of up to 48 line items request 3 + 5 x 159 = 798; a
+// 49th slot would make it 813. client.test.ts prices the query that is
+// actually sent and fails above 800, and raising any of these numbers means
+// lowering another. An order with more line items keeps its first 48 and is
+// stored with itemsTruncated set (from the line item pageInfo, see
+// normalize.ts), so nothing built from the snapshot can mistake it for the
+// whole order.
 export const ORDERS_PER_PAGE = 5;
-const LINE_ITEMS_PER_ORDER = 49;
+const LINE_ITEMS_PER_ORDER = 48;
+// The delivered state lives on each fulfillment (displayStatus). A list that
+// comes back with all 3 slots filled may continue beyond them, so normalize
+// never reads such an order as delivered (see deliveredOf in normalize.ts).
+export const FULFILLMENTS_PER_ORDER = 3;
 // 100 pages of 5 keep one run's ceiling at 500 orders. A shop's rate bucket
 // may well end a large run before that (see retryable below), which is fine:
 // the cursor carries on next tick.
 export const MAX_PAGES = 100;
 
-// Both the cursor and the updated_at search ride as GraphQL variables, so no
-// runtime value is ever spliced into the query document itself (the two page
-// sizes are the module constants above).
-const ORDERS_QUERY = `
-query OrdersUpdatedSince($cursor: String, $search: String) {
-  orders(first: ${ORDERS_PER_PAGE}, after: $cursor, sortKey: UPDATED_AT, query: $search) {
-    nodes {
+// The order selection, shared by the page query below and the single-order
+// query a webhook uses (src/server/shopify/admin.ts), so both store exactly
+// the same snapshot shape through normalizeOrders.
+export const ORDER_FIELDS = `
       id
       legacyResourceId
       name
@@ -91,10 +95,19 @@ query OrdersUpdatedSince($cursor: String, $search: String) {
       totalPriceSet { shopMoney { amount currencyCode } }
       customer { firstName lastName displayName email }
       shippingAddress { name firstName lastName address1 address2 city provinceCode zip countryCode }
+      fulfillments(first: ${FULFILLMENTS_PER_ORDER}) { displayStatus }
       lineItems(first: ${LINE_ITEMS_PER_ORDER}) {
         nodes { title quantity sku variantTitle originalUnitPriceSet { shopMoney { amount } } }
         pageInfo { hasNextPage }
-      }
+      }`;
+
+// Both the cursor and the updated_at search ride as GraphQL variables, so no
+// runtime value is ever spliced into the query document itself (the page
+// sizes are the module constants above).
+const ORDERS_QUERY = `
+query OrdersUpdatedSince($cursor: String, $search: String) {
+  orders(first: ${ORDERS_PER_PAGE}, after: $cursor, sortKey: UPDATED_AT, query: $search) {
+    nodes {${ORDER_FIELDS}
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -378,4 +391,203 @@ export async function testShopConnection(
   // The name goes back to the browser; scrubbed like every other string
   // that originated outside this worker.
   return { kind: "ok", shopName: scrub(shop.name, token), accessScopes };
+}
+
+// Strips every secret in the list from a detail string (see scrub).
+function scrubAll(detail: string, secrets: string[]): string {
+  return secrets.reduce((text, secret) => scrub(text, secret), detail);
+}
+
+function errorName(e: unknown): unknown {
+  return typeof e === "object" && e !== null ? (e as { name?: unknown }).name : undefined;
+}
+
+export type TokenMintResult =
+  | {
+      kind: "ok";
+      accessToken: string;
+      // Shopify's readback of the scopes on the app's released version.
+      scopes: string[];
+      expiresInSeconds: number;
+    }
+  // Shopify refused the credentials (HTTP 400, 401 or 403); detail is
+  // Shopify's own error code and description when it sent them.
+  | { kind: "rejected"; detail: string }
+  // HTTP 404: no store answers at this myshopify.com address.
+  | { kind: "no-store" }
+  | { kind: "transient"; detail: string }
+  | { kind: "fatal"; detail: string };
+
+// A platform admin may be waiting on this (connecting a store), so it gets
+// the short budget of the connection test.
+const TOKEN_MINT_TIMEOUT_MS = 15000;
+const MINT_DETAIL_MAX = 300;
+
+// The client credentials grant (platform amendment section 3): trades a Dev
+// Dashboard app's Client ID and secret for an access token that lasts about
+// 24 hours. POST https://{shop}/admin/oauth/access_token, form encoded. The
+// same protections as every other request here: the host must pass the
+// allowlist before anything is sent, redirects are never followed (they
+// would re-send the secret), the request has a timeout, and no detail
+// string ever contains the secret or the minted token. Never throws.
+export async function mintAccessToken(
+  shopDomain: string,
+  clientId: string,
+  clientSecret: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<TokenMintResult> {
+  if (!SHOP_DOMAIN.test(shopDomain)) {
+    return { kind: "fatal", detail: "invalid shop domain" };
+  }
+  const secrets = [clientSecret];
+  const form = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+  });
+
+  let response: Response;
+  try {
+    response = await fetchImpl(`https://${shopDomain}/admin/oauth/access_token`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        accept: "application/json",
+      },
+      body: form.toString(),
+      redirect: "manual",
+      signal: AbortSignal.timeout(TOKEN_MINT_TIMEOUT_MS),
+    });
+  } catch (e) {
+    const name = errorName(e);
+    if (name === "TimeoutError" || name === "AbortError") {
+      return { kind: "transient", detail: "Shopify request timed out" };
+    }
+    const message = e instanceof Error ? e.message : "fetch threw";
+    return { kind: "transient", detail: scrubAll(`network error: ${message}`, secrets) };
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    body = undefined;
+  }
+  if (isRecord(body) && typeof body.access_token === "string") {
+    secrets.push(body.access_token);
+  }
+
+  if (response.status === 404) {
+    return { kind: "no-store" };
+  }
+  if (response.status === 400 || response.status === 401 || response.status === 403) {
+    const parts = isRecord(body)
+      ? [body.error, body.error_description].filter(
+          (part): part is string => typeof part === "string" && part.length > 0,
+        )
+      : [];
+    const detail = parts.length > 0 ? parts.join(": ") : `Shopify responded with HTTP ${response.status}`;
+    return { kind: "rejected", detail: scrubAll(detail, secrets).slice(0, MINT_DETAIL_MAX) };
+  }
+  if (response.status < 200 || response.status >= 300) {
+    return { kind: "transient", detail: `Shopify responded with HTTP ${response.status}` };
+  }
+  if (!isRecord(body)) {
+    return { kind: "transient", detail: "Shopify returned an unreadable token response" };
+  }
+  const accessToken = body.access_token;
+  const expiresIn = body.expires_in;
+  if (
+    typeof accessToken !== "string" ||
+    accessToken.length === 0 ||
+    typeof expiresIn !== "number" ||
+    !Number.isFinite(expiresIn) ||
+    expiresIn <= 0
+  ) {
+    return { kind: "transient", detail: "Shopify returned an unexpected token response" };
+  }
+  const scopes =
+    typeof body.scope === "string"
+      ? body.scope
+          .split(",")
+          .map((scope) => scope.trim())
+          .filter((scope) => scope.length > 0)
+      : [];
+  return { kind: "ok", accessToken, scopes, expiresInSeconds: expiresIn };
+}
+
+export type GraphqlResult =
+  | { kind: "ok"; data: Record<string, unknown> }
+  | { kind: "auth" }
+  | { kind: "transient"; detail: string }
+  | { kind: "fatal"; detail: string };
+
+// Single Admin GraphQL requests (webhook subscriptions, one order, one
+// customer, tag and fulfillment writes) answer within this budget.
+const GRAPHQL_TIMEOUT_MS = 20000;
+
+// One Admin GraphQL request for the Shopify stage's operations
+// (src/server/shopify/admin.ts). Every runtime value travels in variables,
+// never spliced into the document. Same protections as the sync's page
+// requests: allowlisted host, no redirects, a timeout, no token in any
+// detail. A THROTTLED error, a non-2xx other than 401/403 and a garbled body
+// are transient; any other GraphQL error is fatal in Shopify's own words.
+// Mutation userErrors arrive inside data and are the caller's to read.
+// Never throws.
+export async function shopifyGraphql(
+  shopDomain: string,
+  token: string,
+  query: string,
+  variables: Record<string, unknown>,
+  fetchImpl: typeof fetch = fetch,
+): Promise<GraphqlResult> {
+  if (!SHOP_DOMAIN.test(shopDomain)) {
+    return { kind: "fatal", detail: "invalid shop domain" };
+  }
+  let response: Response;
+  try {
+    response = await fetchImpl(`https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+      method: "POST",
+      headers: {
+        "X-Shopify-Access-Token": token,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ query, variables }),
+      redirect: "manual",
+      signal: AbortSignal.timeout(GRAPHQL_TIMEOUT_MS),
+    });
+  } catch (e) {
+    const name = errorName(e);
+    if (name === "TimeoutError" || name === "AbortError") {
+      return { kind: "transient", detail: "Shopify request timed out" };
+    }
+    const message = e instanceof Error ? e.message : "fetch threw";
+    return { kind: "transient", detail: scrub(`network error: ${message}`, token) };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return { kind: "auth" };
+  }
+  if (response.status < 200 || response.status >= 300) {
+    return { kind: "transient", detail: `Shopify responded with HTTP ${response.status}` };
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { kind: "transient", detail: "Shopify returned invalid JSON" };
+  }
+  const errors = isRecord(body) ? body.errors : undefined;
+  if (Array.isArray(errors) && errors.length > 0) {
+    if (isThrottled(errors)) {
+      return { kind: "transient", detail: "Shopify throttled the request" };
+    }
+    const first = errors[0] as { message?: unknown } | null;
+    const message =
+      typeof first?.message === "string" ? first.message : "Shopify returned a GraphQL error";
+    return { kind: "fatal", detail: scrub(message, token) };
+  }
+  if (!isRecord(body) || !isRecord(body.data)) {
+    return { kind: "transient", detail: "unexpected response shape" };
+  }
+  return { kind: "ok", data: body.data };
 }

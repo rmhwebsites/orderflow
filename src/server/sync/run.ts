@@ -6,8 +6,8 @@ import { and, asc, desc, eq, inArray, lt, lte } from "drizzle-orm";
 import type { Db } from "../../db";
 import { applyBatch, rowsAffected } from "../../db/batch";
 import { events, orders, statuses, storeConnections } from "../../db/schema";
-import { decryptSecret } from "../crypto";
 import { fetchOrdersUpdatedSince } from "../shopify/client";
+import { accessTokenFor } from "../shopify/token";
 import { normalizeOrders } from "../shopify/normalize";
 
 export type SyncResult = {
@@ -45,7 +45,10 @@ const SYNC_ERROR_EVENT_WINDOW_MS = 3600000;
 export const EXISTENCE_CHUNK = 50;
 
 const TOKEN_UNREADABLE = "Token unreadable, re-enter it in Settings";
+const CREDENTIALS_UNREADABLE = "Store credentials unreadable, reconnect the store in Settings";
 const TOKEN_REJECTED = "Shopify rejected the token. Update the connection in Settings.";
+const credentialsRejected = (detail: string) =>
+  `Shopify rejected the app's Client ID and secret (${detail}). Reconnect the store in Settings.`;
 
 function clip(text: string): string {
   return text.slice(0, LAST_ERROR_MAX);
@@ -265,17 +268,48 @@ export async function runSync(
       .limit(1);
     const connection = connRows[0] ?? preLease;
 
-    let token: string;
-    try {
-      token = await decryptSecret(connection.encryptedToken, env.ENCRYPTION_KEY, workspaceId);
-    } catch {
+    // legacy_token: the stored token. client_credentials: the cached token,
+    // renewed first when it is near expiry (src/server/shopify/token.ts).
+    const access = await accessTokenFor(db, env, connection, {
+      fetchImpl: opts?.fetchImpl,
+      now: () => now,
+    });
+    if (access.kind === "unavailable") {
+      // Disconnected since the pre-lease read (a disconnect also releases
+      // the lease, so this write normally matches nothing).
+      const held = await fencedConnectionWrite(db, workspaceId, myLease, { runningUntil: 0 });
+      return {
+        ...empty(),
+        skipped: access.reason === "disabled" ? "disabled" : "no-connection",
+        ...(held ? {} : { superseded: true }),
+      };
+    }
+    if (access.kind === "unreadable" || access.kind === "rejected") {
+      const message = clip(
+        access.kind === "rejected"
+          ? credentialsRejected(access.detail)
+          : connection.authMode === "client_credentials"
+            ? CREDENTIALS_UNREADABLE
+            : TOKEN_UNREADABLE,
+      );
       const held = await fencedConnectionWrite(db, workspaceId, myLease, {
         status: "error",
-        lastError: TOKEN_UNREADABLE,
+        lastError: message,
         runningUntil: 0,
       });
-      return { ...empty(), error: TOKEN_UNREADABLE, ...(held ? {} : { superseded: true }) };
+      return { ...empty(), error: message, ...(held ? {} : { superseded: true }) };
     }
+    if (access.kind === "transient") {
+      // Like a transient fetch failure: status, lastSyncAt and any cursor
+      // chain stay as they are, and the next tick tries again.
+      const detail = clip(access.detail);
+      const held = await fencedConnectionWrite(db, workspaceId, myLease, {
+        lastError: detail,
+        runningUntil: 0,
+      });
+      return { ...empty(), error: detail, ...(held ? {} : { superseded: true }) };
+    }
+    const token = access.token;
 
     // A persisted cursor means an earlier run stopped before the end of its
     // window: resume that exact window from the cursor instead of opening a

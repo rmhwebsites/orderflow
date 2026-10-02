@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  FULFILLMENTS_PER_ORDER,
   fetchOrdersUpdatedSince,
   MAX_PAGES,
   ORDERS_PER_PAGE,
@@ -112,6 +113,13 @@ function costOfField(field: QueryField): number {
   if (field.pageSize === null) {
     return 1 + sum(field.fields);
   }
+  // A list of objects with a size argument (Order.fulfillments(first: 3)) is
+  // not a connection, and the documentation does not price it. Priced here
+  // like a connection whose nodes are the list items, which can only
+  // overstate the cost.
+  if (!field.fields.some((child) => child.name === "nodes" || child.name === "edges")) {
+    return 2 + field.pageSize * (1 + sum(field.fields));
+  }
   let perNode = 0;
   let once = 2;
   for (const child of field.fields) {
@@ -163,7 +171,8 @@ describe("fetchOrdersUpdatedSince", () => {
     expect(query).toContain("sortKey: UPDATED_AT");
     expect(query).toContain("query: $search");
     expect(query).toContain("legacyResourceId");
-    expect(query).toContain("lineItems(first: 49)");
+    expect(query).toContain("lineItems(first: 48)");
+    expect(query).toContain("fulfillments(first: 3) { displayStatus }");
     expect(variablesOf(calls[0]).cursor).toBeNull();
     expect(variablesOf(calls[0]).search).toBe(SEARCH);
   });
@@ -405,9 +414,30 @@ describe("fetchOrdersUpdatedSince", () => {
     const lineItems = orders.fields
       .find((field) => field.name === "nodes")
       ?.fields.find((field) => field.name === "lineItems");
-    expect(lineItems?.pageSize).toBe(49);
+    expect(lineItems?.pageSize).toBe(48);
     const pageInfo = lineItems?.fields.find((field) => field.name === "pageInfo");
     expect(pageInfo?.fields.map((field) => field.name)).toContain("hasNextPage");
+  });
+
+  // The delivered state lives on each fulfillment (displayStatus), not on the
+  // order. A list that comes back full may have more items beyond it, which
+  // normalize reads as "not confirmed delivered".
+  it("asks for each order's fulfillment display statuses, three at most", async () => {
+    const { impl, calls } = stubFetch([ordersPage([], { hasNextPage: false, endCursor: null })]);
+    await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
+    const [orders] = parseQueryFields(String(calls[0].body.query));
+    const fulfillments = orders.fields
+      .find((field) => field.name === "nodes")
+      ?.fields.find((field) => field.name === "fulfillments");
+    expect(fulfillments?.pageSize).toBe(FULFILLMENTS_PER_ORDER);
+    expect(FULFILLMENTS_PER_ORDER).toBe(3);
+    expect(fulfillments?.fields.map((field) => field.name)).toEqual(["displayStatus"]);
+  });
+
+  it("prices a sized list of objects at least like a connection", () => {
+    expect(requestedQueryCost("{ order(id: 1) { fulfillments(first: 3) { displayStatus } } }")).toBe(
+      1 + 2 + 3,
+    );
   });
 
   it("keeps the orders query inside Shopify's single query cost limit", async () => {
@@ -416,10 +446,11 @@ describe("fetchOrdersUpdatedSince", () => {
     const cost = requestedQueryCost(String(calls[0].body.query));
     // Per order: the order itself, two price sets of two objects each, the
     // customer, the shipping address, the line item connection and its
-    // pageInfo make 10 points, plus 3 per line item slot (the item and its
-    // price set). On top come 2 for the orders connection and 1 for pageInfo.
-    // A 50th line item slot would make it 3 + 5 * (10 + 3 * 50) = 803.
-    expect(cost).toBe(3 + 5 * (10 + 3 * 49));
+    // pageInfo make 10 points, the fulfillment list (3 slots, priced like a
+    // connection) 5 more, plus 3 per line item slot (the item and its price
+    // set). On top come 2 for the orders connection and 1 for pageInfo.
+    // A 49th line item slot would make it 3 + 5 * (15 + 3 * 49) = 813.
+    expect(cost).toBe(3 + 5 * (15 + 3 * 48));
     expect(cost).toBeLessThanOrEqual(QUERY_COST_BUDGET);
   });
 

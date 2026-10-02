@@ -215,6 +215,63 @@ describe("normalizeOrders", () => {
     }
   });
 
+  // The delivered state (platform amendment section 4) is confirmed only
+  // when Shopify reports the order fulfilled and every fulfillment that was
+  // not canceled as delivered or picked up, from a list known to be whole.
+  describe("delivered", () => {
+    const withFulfillments = (displayFulfillmentStatus: unknown, fulfillments: unknown) =>
+      normalizeOrders([
+        { id: "gid://shopify/Order/7101", name: "#1101", displayFulfillmentStatus, fulfillments },
+      ])[0];
+
+    it("is true for a fulfilled order whose fulfillments are all delivered or picked up", () => {
+      expect(withFulfillments("FULFILLED", [{ displayStatus: "DELIVERED" }]).delivered).toBe(true);
+      expect(
+        withFulfillments("FULFILLED", [{ displayStatus: "DELIVERED" }, { displayStatus: "PICKED_UP" }])
+          .delivered,
+      ).toBe(true);
+      // A canceled fulfillment does not hold the order back.
+      expect(
+        withFulfillments("FULFILLED", [{ displayStatus: "CANCELED" }, { displayStatus: "DELIVERED" }])
+          .delivered,
+      ).toBe(true);
+    });
+
+    it("is false unless every live fulfillment is confirmed delivered", () => {
+      const cases: Array<[unknown, unknown]> = [
+        ["FULFILLED", [{ displayStatus: "IN_TRANSIT" }]],
+        ["FULFILLED", [{ displayStatus: "DELIVERED" }, { displayStatus: "OUT_FOR_DELIVERY" }]],
+        ["FULFILLED", [{ displayStatus: "CANCELED" }]],
+        ["FULFILLED", []],
+        ["FULFILLED", undefined],
+        ["FULFILLED", null],
+        ["FULFILLED", "DELIVERED"],
+        ["FULFILLED", [null]],
+        // Not fulfilled as a whole: a partial delivery is not the order's.
+        ["PARTIALLY_FULFILLED", [{ displayStatus: "DELIVERED" }]],
+        ["UNFULFILLED", [{ displayStatus: "DELIVERED" }]],
+        [undefined, [{ displayStatus: "DELIVERED" }]],
+        // A full list (three slots) may have more fulfillments beyond it.
+        [
+          "FULFILLED",
+          [{ displayStatus: "DELIVERED" }, { displayStatus: "DELIVERED" }, { displayStatus: "DELIVERED" }],
+        ],
+      ];
+      for (const [status, fulfillments] of cases) {
+        expect(
+          withFulfillments(status, fulfillments).delivered,
+          JSON.stringify([status, fulfillments]),
+        ).toBe(false);
+      }
+    });
+
+    it("stays false for the fixture orders, which carry no fulfillment list", () => {
+      for (const order of normalizeOrders(fixture)) {
+        expect(order.delivered).toBe(false);
+      }
+    });
+  });
+
   it("returns [] for malformed payloads", () => {
     expect(normalizeOrders(null)).toEqual([]);
     expect(normalizeOrders(undefined)).toEqual([]);

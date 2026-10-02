@@ -3,6 +3,8 @@
 // (storage is JSON, not HTML; escaping is the renderer's job), unknown shapes
 // degrade to defaults, and orders without any usable id are skipped.
 
+import { FULFILLMENTS_PER_ORDER } from "./client";
+
 export type NormalizedOrder = {
   shopifyOrderId: string;
   name: string;
@@ -13,6 +15,9 @@ export type NormalizedOrder = {
   currency: string;
   financialStatus: string;
   fulfillmentStatus: string;
+  // True only when Shopify confirmed delivery of the whole order (see
+  // deliveredOf). The Shopify state mapping in status-sync.ts reads it.
+  delivered: boolean;
   items: { title: string; qty: number; price: string | null; sku: string; variant: string }[];
   // True unless Shopify confirmed that items holds every line item on the
   // order. Anything built from items, such as a purchase order, must treat a
@@ -125,6 +130,29 @@ function itemsTruncatedOf(order: Dict): boolean {
   return !(isDict(pageInfo) && pageInfo.hasNextPage === false);
 }
 
+// Fulfillment display statuses that mean the customer has the goods.
+const DELIVERED_DISPLAY = new Set(["DELIVERED", "PICKED_UP"]);
+
+// Delivered means: Shopify reports the order FULFILLED as a whole, and every
+// fulfillment that was not canceled (at least one) shows DELIVERED or
+// PICKED_UP. The query asks for FULFILLMENTS_PER_ORDER fulfillments; a list
+// that comes back full may continue past them, so it never confirms
+// delivery. Anything missing or malformed reads as not delivered.
+function deliveredOf(order: Dict): boolean {
+  if (order.displayFulfillmentStatus !== "FULFILLED") {
+    return false;
+  }
+  const list = order.fulfillments;
+  if (!Array.isArray(list) || list.length === 0 || list.length >= FULFILLMENTS_PER_ORDER) {
+    return false;
+  }
+  const live = list.filter((item) => !(isDict(item) && item.displayStatus === "CANCELED"));
+  return (
+    live.length > 0 &&
+    live.every((item) => isDict(item) && typeof item.displayStatus === "string" && DELIVERED_DISPLAY.has(item.displayStatus))
+  );
+}
+
 function shippingOf(order: Dict): NormalizedOrder["shipping"] {
   const address = order.shippingAddress;
   if (!isDict(address)) {
@@ -173,6 +201,7 @@ function normalizeOne(raw: unknown): NormalizedOrder | null {
     currency: str(money?.currencyCode) || "USD",
     financialStatus: statusText(raw.displayFinancialStatus, ""),
     fulfillmentStatus: statusText(raw.displayFulfillmentStatus, "unfulfilled"),
+    delivered: deliveredOf(raw),
     items: itemsOf(raw),
     itemsTruncated: itemsTruncatedOf(raw),
     shipping: shippingOf(raw),
