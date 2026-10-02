@@ -53,16 +53,18 @@ const REQUEST_TIMEOUT_MS = 90000;
 // a query whose requested cost is above 1,000 points before running it, on
 // every plan. Scalars are free, an object costs 1 point and a connection 2,
 // and everything selected under a connection is multiplied by its page size.
-// One order therefore costs 9 points (the order, two price sets of two
-// objects each, customer, shipping address, the line item connection) plus
-// 3 per line item slot (the item and its price set), which makes orders x
-// line items the whole budget: 50 x 50 would request 7,953 points. Five
-// orders of up to fifty line items request 3 + 5 x 159 = 798. The line item
-// cap stays at 50 so no order loses items it had before; raising either
-// number means lowering the other. client.test.ts prices the query that is
-// actually sent and fails above 800.
+// One order therefore costs 10 points (the order, two price sets of two
+// objects each, customer, shipping address, the line item connection and its
+// pageInfo) plus 3 per line item slot (the item and its price set), which
+// makes orders x line items the whole budget. Five orders of up to 49 line
+// items request 3 + 5 x 157 = 788; a 50th slot would make it 803.
+// client.test.ts prices the query that is actually sent and fails above 800,
+// and raising either number means lowering the other. An order with more
+// line items keeps its first 49 and is stored with itemsTruncated set (from
+// the line item pageInfo, see normalize.ts), so nothing built from the
+// snapshot can mistake it for the whole order.
 export const ORDERS_PER_PAGE = 5;
-const LINE_ITEMS_PER_ORDER = 50;
+const LINE_ITEMS_PER_ORDER = 49;
 // 100 pages of 5 keep one run's ceiling at 500 orders. A shop's rate bucket
 // may well end a large run before that (see retryable below), which is fine:
 // the cursor carries on next tick.
@@ -89,7 +91,10 @@ query OrdersUpdatedSince($cursor: String, $search: String) {
       totalPriceSet { shopMoney { amount currencyCode } }
       customer { firstName lastName displayName email }
       shippingAddress { name firstName lastName address1 address2 city provinceCode zip countryCode }
-      lineItems(first: ${LINE_ITEMS_PER_ORDER}) { nodes { title quantity sku variantTitle originalUnitPriceSet { shopMoney { amount } } } }
+      lineItems(first: ${LINE_ITEMS_PER_ORDER}) {
+        nodes { title quantity sku variantTitle originalUnitPriceSet { shopMoney { amount } } }
+        pageInfo { hasNextPage }
+      }
     }
     pageInfo { hasNextPage endCursor }
   }

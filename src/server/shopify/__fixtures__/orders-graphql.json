@@ -44,7 +44,8 @@
               {
                 "title": "Caster Wheel 8\" with \"brake\""
               }
-            ]
+            ],
+            "pageInfo": { "hasNextPage": false }
           }
         },
         {
@@ -75,7 +76,8 @@
                 "variantTitle": "Marine Grade",
                 "originalUnitPriceSet": { "shopMoney": { "amount": "160.00" } }
               }
-            ]
+            ],
+            "pageInfo": { "hasNextPage": false }
           }
         },
         {
@@ -89,7 +91,7 @@
           "totalPriceSet": { "shopMoney": { "amount": "75.25", "currencyCode": "USD" } },
           "customer": { "firstName": "Imogen", "lastName": "Vance" },
           "shippingAddress": null,
-          "lineItems": { "nodes": [] }
+          "lineItems": { "nodes": [], "pageInfo": { "hasNextPage": false } }
         },
         {
           "name": "#1004",

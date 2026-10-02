@@ -39,6 +39,7 @@ describe("normalizeOrders", () => {
       { title: "Scaffold Frame 5 ft", qty: 4, price: "89.00", sku: "SF-60", variant: "Galvanized" },
       { title: 'Caster Wheel 8" with "brake"', qty: 1, price: null, sku: "", variant: "" },
     ]);
+    expect(o.itemsTruncated).toBe(false);
   });
 
   it("prefers legacyResourceId over the gid, and parses the gid otherwise", () => {
@@ -155,6 +156,63 @@ describe("normalizeOrders", () => {
     expect(result[0].items).toEqual([
       { title: "Pallet Jack", qty: 2, price: "349.00", sku: "PJ-11", variant: "Standard" },
     ]);
+  });
+
+  // The sync asks for one page of line items per order. When Shopify says
+  // more exist, items holds only that page and the order says so.
+  it("marks an order whose line items continue past the fetched page", () => {
+    const result = normalizeOrders([
+      {
+        id: "gid://shopify/Order/7004",
+        name: "#1010",
+        lineItems: {
+          nodes: [{ title: "Hard Hat", quantity: 3, sku: "HH-1", variantTitle: "White" }],
+          pageInfo: { hasNextPage: true },
+        },
+      },
+    ]);
+    expect(result[0].itemsTruncated).toBe(true);
+    expect(result[0].items).toEqual([
+      { title: "Hard Hat", qty: 3, price: null, sku: "HH-1", variant: "White" },
+    ]);
+  });
+
+  it("reads the marker from edges-wrapped line items too", () => {
+    const result = normalizeOrders([
+      {
+        id: "gid://shopify/Order/7005",
+        name: "#1011",
+        lineItems: {
+          edges: [{ node: { title: "Hard Hat", quantity: 3 } }],
+          pageInfo: { hasNextPage: true },
+        },
+      },
+    ]);
+    expect(result[0].itemsTruncated).toBe(true);
+    expect(result[0].items).toHaveLength(1);
+  });
+
+  // A purchase order is prefilled from items, so a list Shopify never
+  // confirmed as whole must not pass for one.
+  it("counts line items as complete only when Shopify says there is no next page", () => {
+    const withLineItems = (lineItems: unknown) =>
+      normalizeOrders([{ id: "gid://shopify/Order/7006", name: "#1012", lineItems }])[0];
+    expect(withLineItems({ nodes: [], pageInfo: { hasNextPage: false } }).itemsTruncated).toBe(
+      false,
+    );
+    const unconfirmed = [
+      { nodes: [] },
+      { nodes: [], pageInfo: null },
+      { nodes: [], pageInfo: {} },
+      { nodes: [], pageInfo: { hasNextPage: "false" } },
+      null,
+      undefined,
+    ];
+    for (const lineItems of unconfirmed) {
+      expect(withLineItems(lineItems).itemsTruncated, String(JSON.stringify(lineItems))).toBe(
+        true,
+      );
+    }
   });
 
   it("returns [] for malformed payloads", () => {

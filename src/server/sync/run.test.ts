@@ -623,6 +623,30 @@ describe("runSync", () => {
     expect(await eventsIn(db, WS, "order_new")).toHaveLength(1);
   });
 
+  // The desk and the purchase order modal read line items from the stored
+  // snapshot, so the marker has to travel with it.
+  it("stores the line item truncation marker with the snapshot", async () => {
+    const { db, env } = await makeDb();
+    const item = { title: "Hard Hat", quantity: 3, sku: "HH-1", variantTitle: "White" };
+    const partial = { ...rileyNode, lineItems: { nodes: [item], pageInfo: { hasNextPage: true } } };
+    await runSync(db, env, WS, { fetchImpl: pageFetch([partial]).impl, now: () => NOW });
+    const [stored] = await ordersIn(db, WS);
+    expect(stored.shopify).toMatchObject({
+      items: [{ title: "Hard Hat", qty: 3 }],
+      itemsTruncated: true,
+    });
+
+    // The same items, now confirmed whole: the marker alone refreshes it.
+    const whole = { ...rileyNode, lineItems: { nodes: [item], pageInfo: { hasNextPage: false } } };
+    const result = await runSync(db, env, WS, {
+      fetchImpl: pageFetch([whole]).impl,
+      now: () => LATER,
+    });
+    expect(result.updated).toBe(1);
+    const [refreshed] = await ordersIn(db, WS);
+    expect(refreshed.shopify).toMatchObject({ itemsTruncated: false });
+  });
+
   it("gives the order_new event a cross-run deterministic id", async () => {
     const { db, env } = await makeDb();
     await runSync(db, env, WS, { fetchImpl: pageFetch([rileyNode]).impl, now: () => NOW });

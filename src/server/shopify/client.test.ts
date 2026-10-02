@@ -163,7 +163,7 @@ describe("fetchOrdersUpdatedSince", () => {
     expect(query).toContain("sortKey: UPDATED_AT");
     expect(query).toContain("query: $search");
     expect(query).toContain("legacyResourceId");
-    expect(query).toContain("lineItems(first: 50)");
+    expect(query).toContain("lineItems(first: 49)");
     expect(variablesOf(calls[0]).cursor).toBeNull();
     expect(variablesOf(calls[0]).search).toBe(SEARCH);
   });
@@ -396,15 +396,30 @@ describe("fetchOrdersUpdatedSince", () => {
     expect(requestedQueryCost("{ products(first: 1) { edges { node { title } } } }")).toBe(3);
   });
 
+  // An order with more line items than the query asks for is stored with the
+  // first page only, and Shopify's pageInfo is what lets normalize mark it.
+  it("asks whether each order has line items beyond the ones it fetched", async () => {
+    const { impl, calls } = stubFetch([ordersPage([], { hasNextPage: false, endCursor: null })]);
+    await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
+    const [orders] = parseQueryFields(String(calls[0].body.query));
+    const lineItems = orders.fields
+      .find((field) => field.name === "nodes")
+      ?.fields.find((field) => field.name === "lineItems");
+    expect(lineItems?.pageSize).toBe(49);
+    const pageInfo = lineItems?.fields.find((field) => field.name === "pageInfo");
+    expect(pageInfo?.fields.map((field) => field.name)).toContain("hasNextPage");
+  });
+
   it("keeps the orders query inside Shopify's single query cost limit", async () => {
     const { impl, calls } = stubFetch([ordersPage([], { hasNextPage: false, endCursor: null })]);
     await fetchOrdersUpdatedSince(DOMAIN, TOKEN, SINCE, impl);
     const cost = requestedQueryCost(String(calls[0].body.query));
     // Per order: the order itself, two price sets of two objects each, the
-    // customer, the shipping address and the line item connection make 9
-    // points, plus 3 per line item slot (the item and its price set). On top
-    // come 2 for the orders connection and 1 for pageInfo.
-    expect(cost).toBe(3 + 5 * (9 + 3 * 50));
+    // customer, the shipping address, the line item connection and its
+    // pageInfo make 10 points, plus 3 per line item slot (the item and its
+    // price set). On top come 2 for the orders connection and 1 for pageInfo.
+    // A 50th line item slot would make it 3 + 5 * (10 + 3 * 50) = 803.
+    expect(cost).toBe(3 + 5 * (10 + 3 * 49));
     expect(cost).toBeLessThanOrEqual(QUERY_COST_BUDGET);
   });
 

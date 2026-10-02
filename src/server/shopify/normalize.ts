@@ -14,6 +14,10 @@ export type NormalizedOrder = {
   financialStatus: string;
   fulfillmentStatus: string;
   items: { title: string; qty: number; price: string | null; sku: string; variant: string }[];
+  // True unless Shopify confirmed that items holds every line item on the
+  // order. Anything built from items, such as a purchase order, must treat a
+  // true value as a partial list.
+  itemsTruncated: boolean;
   shipping: {
     name: string;
     a1: string;
@@ -113,6 +117,14 @@ function itemsOf(order: Dict): NormalizedOrder["items"] {
   }));
 }
 
+// The sync fetches one page of line items per order. Only an explicit "no
+// next page" from Shopify counts as complete; a missing or malformed answer
+// is treated as truncated.
+function itemsTruncatedOf(order: Dict): boolean {
+  const pageInfo = isDict(order.lineItems) ? order.lineItems.pageInfo : undefined;
+  return !(isDict(pageInfo) && pageInfo.hasNextPage === false);
+}
+
 function shippingOf(order: Dict): NormalizedOrder["shipping"] {
   const address = order.shippingAddress;
   if (!isDict(address)) {
@@ -162,6 +174,7 @@ function normalizeOne(raw: unknown): NormalizedOrder | null {
     financialStatus: statusText(raw.displayFinancialStatus, ""),
     fulfillmentStatus: statusText(raw.displayFulfillmentStatus, "unfulfilled"),
     items: itemsOf(raw),
+    itemsTruncated: itemsTruncatedOf(raw),
     shipping: shippingOf(raw),
     tags: Array.isArray(raw.tags)
       ? raw.tags.filter((tag): tag is string => typeof tag === "string").join(", ")
