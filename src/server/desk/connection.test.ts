@@ -544,10 +544,13 @@ describe("deleteConnection", () => {
       encryptedClientSecret: "v1.secret-ciphertext",
       encryptedAccessToken: "v1.access-ciphertext",
       accessTokenExpiresAt: 1_759_100_000_000,
+      webhooksRegisteredAt: 1_759_000_000_000,
     });
     await seedOrder(db, WS, { id: "o1" });
 
     await deleteConnection(db, WS);
+    // Deliveries for a disabled store are refused, so live updates are off.
+    expect((await connectionRow(db)).webhooksRegisteredAt).toBeNull();
     expect(await connectionRow(db)).toMatchObject({
       shopDomain: "impactrentals.myshopify.com",
       status: "disabled",

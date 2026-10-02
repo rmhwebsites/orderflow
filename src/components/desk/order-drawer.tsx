@@ -465,11 +465,15 @@ export function OrderDrawerContent({
   const fulfillment = snapshot?.fulfillmentStatus ?? summary?.fulfillmentStatus ?? "";
   const shopifyUrl = order ? shopifyAdminOrderUrl(shopDomain, order.shopifyOrderId) : null;
   const itemsTruncated = detail.status === "ready" ? detail.itemsTruncated : (summary?.itemsTruncated ?? false);
+  // A status set with no person behind it came from Shopify (a fulfillment,
+  // a delivery or the Ordering Desk tag edited there).
   const setBy = statusSetBy
     ? statusSetBy === selfUserId
       ? "you"
       : members.get(statusSetBy)?.name?.trim() || members.get(statusSetBy)?.email || "a former member"
-    : null;
+    : statusSetAt !== null
+      ? "Shopify"
+      : null;
   const now = useNow(30000);
 
   return (

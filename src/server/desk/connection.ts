@@ -475,6 +475,9 @@ export async function deleteConnection(db: Db, workspaceId: string): Promise<voi
       encryptedClientSecret: null,
       encryptedAccessToken: null,
       accessTokenExpiresAt: null,
+      // The webhook receiver refuses a disabled store's deliveries, so live
+      // updates are off until the store is connected again.
+      webhooksRegisteredAt: null,
       lastError: null,
       runningUntil: 0,
     })

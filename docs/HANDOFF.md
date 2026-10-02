@@ -462,3 +462,97 @@ Supersedes the 798 point figure and the old line item limit above.
   PLATFORM_ADMIN_EMAILS in .dev.vars (see .dev.vars.example).
 - Settings links stay hidden behind SETTINGS_PAGE_AVAILABLE
   (src/lib/features.ts) until the settings stage builds the page.
+
+## Connecting a Shopify store
+
+Written for Ryan. Only a platform admin can do this, and the Client secret
+is entered only in Ordering Desk: never paste it into chat, email or a
+ticket.
+
+1. Open the Shopify Dev Dashboard (dev.shopify.com) under the organization
+   that owns the store, and create an app for Ordering Desk (or open the one
+   you already made). The store has to belong to that same organization:
+   Shopify only hands out these tokens for stores in your own organization.
+2. In the app's configuration, give it these Admin API access scopes, then
+   release the version:
+   - read_orders and write_orders (read and tag orders)
+   - read_customers (customers tagged "Ordering Desk Manager" or "Ordering
+     Desk Staff" get access)
+   - read_merchant_managed_fulfillment_orders and
+     write_merchant_managed_fulfillment_orders (moving an order to Shipped
+     marks it fulfilled in Shopify, without emailing the customer)
+3. Install the app on the store and approve those permissions there.
+4. In the Dev Dashboard, open the app's settings and copy its Client ID and
+   Client secret.
+5. In Ordering Desk, open the workspace's Settings, Store connection, and
+   enter the store's .myshopify.com address, the Client ID and the Client
+   secret. (Until the settings screen ships, the same three fields go to
+   PUT /api/workspaces/<workspace id>/connection as JSON from a signed-in
+   platform admin session.) Ordering Desk checks them with Shopify right
+   away: if a permission is missing it says which one, and nothing is
+   saved. When they are accepted it also switches on live updates
+   (webhooks); if Shopify refuses those, the store still connects and syncs
+   every 10 minutes, and connecting again retries them.
+6. If you change the scopes later, release a new app version, approve it on
+   the store, and connect again.
+
+Once connected:
+- Tag a Shopify customer "Ordering Desk Manager" or "Ordering Desk Staff"
+  to give them that role in the workspace (removing the tag removes the
+  access). People invited by hand inside Ordering Desk are never affected
+  by tags.
+- Every status change in Ordering Desk shows on the Shopify order as one
+  tag, "Ordering Desk: <status>". Editing that tag in Shopify changes the
+  status in Ordering Desk. Fulfilling or delivering in Shopify moves the
+  order forward to Shipped or Delivered (never backward).
+- An older store app with an Admin API token (shpat_...) can still be
+  connected with the token instead of a Client ID and secret. It needs the
+  same permissions, gets no live updates (its webhooks could not be
+  verified), and syncs every 10 minutes.
+
+## STATE UPDATE, 2026-10-02 platform phase Shopify stage (supersedes above)
+
+- Branch build/m1-core on top of 1e2f091: 45ba9ae (client credentials
+  token), 83ef8be (connection + webhook registration), 08bdf5a (two-way
+  status), 041418f (webhooks + roster), plus this docs commit. Not pushed,
+  not deployed. No new migration: 0004 is still the one to apply remotely
+  first (the new events.type value shopify_write is a TypeScript enum only;
+  the column has no CHECK).
+- Connection (src/server/desk/connection.ts): {shopDomain, clientId,
+  clientSecret} or {shopDomain, token}. Both modes must carry
+  REQUIRED_SCOPES (a write scope implies its read scope); a 422 names each
+  missing one. Client credentials: token minted at connect, cached
+  encrypted with its expiry, renewed within 10 minutes of expiry by
+  src/server/shopify/token.ts (compare-and-set cache write; concurrent
+  renewals both get a valid token). runSync and every Shopify call get
+  their token there.
+- Webhooks: registered on a client-credentials connect for 10 topics at
+  APP_URL/api/webhooks/shopify/<workspaceId> (webhookSubscriptionCreate
+  with uri and format JSON; this workspace's old subscriptions for that
+  exact address are deleted first). Receiver: src/server/shopify/webhooks.ts.
+  Local dev cannot receive them (Shopify needs a public https address).
+- Two-way status (src/server/shopify/status-sync.ts, whose header documents
+  the rules and the Shopify state mapping): only CHANGES between the stored
+  and the fresh snapshot move a status, never an old state; tag edits win
+  over fulfillment moves; echo window 10 minutes. App changes push the tag
+  (and fulfill for a status linked to fulfilled) after the response; the
+  outcome is a shopify_write event in the timeline.
+- The order query now asks for fulfillments(first: 3) { displayStatus } and
+  lineItems(first: 48) (was 49): 798 points by the client.test.ts
+  estimator, which prices the fulfillment list like a connection. The live
+  cost check above still applies, with 798 as the expected figure (or
+  lower: Shopify may price the list below the estimate).
+- NOT VERIFIED LIVE (validated only against Shopify's current published
+  schema, and by stubbed tests): the client credentials grant and its error
+  shapes, webhookSubscriptionCreate's uri field and fulfillmentCreate on
+  API 2025-07, the customers tag search, and Customer.email (deprecated in
+  newer versions in favor of defaultEmailAddress). First live connect: watch
+  the connect response (warning field) and the first webhook deliveries.
+- Known limits: an order with 3 or more fulfillments never moves to
+  Delivered automatically (the list may continue past 3); a Shopify tag
+  naming a status the order held in the last 10 minutes is read as the
+  app's own late write; a delivery that Shopify records only on the
+  fulfillment (shipment status) may not change the order's updated_at, so
+  the cron may never re-read that order and only the fulfillments/update
+  webhook carries it (Shopify retries a failed delivery for 48 hours; not
+  verified live).
