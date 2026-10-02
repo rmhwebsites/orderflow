@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 import { authClient } from "@/lib/auth-client";
+import { APP_NAME } from "@/lib/brand";
+import { ui } from "@/components/ui";
 
 export default function SignInPage() {
   const [email, setEmail] = useState("");
@@ -28,21 +30,21 @@ export default function SignInPage() {
   }
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-sm flex-col justify-center gap-6 px-6 font-sans">
+    <main className="mx-auto flex min-h-dvh max-w-sm flex-col justify-center gap-6 px-4 sm:px-6">
       <div>
-        <h1 className="font-display text-2xl font-semibold">Order Desk</h1>
-        <p className="mt-1 text-sm opacity-70">Sign in with your email address.</p>
+        <h1 className="font-display text-2xl font-semibold tracking-tight">{APP_NAME}</h1>
+        <p className="mt-1 text-sm text-ink-2">Sign in with your email address.</p>
       </div>
       {phase === "sent" ? (
-        <div className="rounded-lg border border-black/10 bg-white p-4">
+        <div className={`${ui.panel} p-4`} role="status">
           <p className="font-medium">Check your email</p>
-          <p className="mt-1 text-sm opacity-70">
+          <p className="mt-1 text-sm text-ink-2">
             We sent a sign-in link to {email}. It expires in 5 minutes.
           </p>
         </div>
       ) : (
-        <form onSubmit={handleSubmit} className="flex flex-col gap-3">
-          <label className="text-sm font-medium" htmlFor="email">
+        <form onSubmit={handleSubmit} className="flex flex-col gap-2">
+          <label className={ui.label} htmlFor="email">
             Email
           </label>
           <input
@@ -53,17 +55,17 @@ export default function SignInPage() {
             value={email}
             onChange={(event) => setEmail(event.target.value)}
             placeholder="you@company.com"
-            className="rounded-lg border border-black/15 bg-white px-3 py-2 outline-none focus:border-[var(--accent)]"
+            aria-invalid={phase === "error" ? true : undefined}
+            aria-describedby={phase === "error" ? "sign-in-error" : undefined}
+            className={ui.input}
           />
-          <button
-            type="submit"
-            disabled={phase === "sending"}
-            className="rounded-lg bg-[var(--accent)] px-3 py-2 font-medium text-[var(--ink)] disabled:opacity-50"
-          >
+          <button type="submit" disabled={phase === "sending"} className={`${ui.buttonPrimary} mt-2`}>
             {phase === "sending" ? "Sending" : "Send sign-in link"}
           </button>
           {phase === "error" ? (
-            <p className="text-sm text-red-600">{errorMessage}</p>
+            <p id="sign-in-error" className={ui.errorText}>
+              {errorMessage}
+            </p>
           ) : null}
         </form>
       )}

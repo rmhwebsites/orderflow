@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { ui } from "@/components/ui";
 
 export function NewWorkspaceForm() {
   const router = useRouter();
@@ -38,24 +39,31 @@ export function NewWorkspaceForm() {
 
   return (
     <form onSubmit={handleSubmit} className="flex flex-col gap-2">
+      <label htmlFor="new-workspace-name" className={ui.label}>
+        Workspace name
+      </label>
       <div className="flex gap-2">
         <input
+          id="new-workspace-name"
           type="text"
           required
+          maxLength={80}
           value={name}
           onChange={(event) => setName(event.target.value)}
-          placeholder="New workspace name"
-          className="flex-1 rounded-lg border border-black/15 bg-white px-3 py-2 outline-none focus:border-[var(--accent)]"
+          placeholder="IMPACT Rentals"
+          aria-invalid={errorMessage ? true : undefined}
+          aria-describedby={errorMessage ? "new-workspace-error" : undefined}
+          className={ui.input}
         />
-        <button
-          type="submit"
-          disabled={busy}
-          className="rounded-lg bg-[var(--accent)] px-4 py-2 font-medium text-[var(--ink)] disabled:opacity-50"
-        >
+        <button type="submit" disabled={busy} className={ui.buttonPrimary}>
           {busy ? "Creating" : "Create"}
         </button>
       </div>
-      {errorMessage ? <p className="text-sm text-red-600">{errorMessage}</p> : null}
+      {errorMessage ? (
+        <p id="new-workspace-error" className={ui.errorText}>
+          {errorMessage}
+        </p>
+      ) : null}
     </form>
   );
 }

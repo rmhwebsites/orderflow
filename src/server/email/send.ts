@@ -1,3 +1,5 @@
+import { APP_NAME } from "../../lib/brand";
+
 // Email driver: Cloudflare Email Service send binding (wrangler.jsonc
 // "send_email", bound as EMAIL). All app email goes through sendEmail so the
 // localhost fallback applies everywhere: in local dev the binding cannot
@@ -7,7 +9,7 @@
 // Default sender for app email until per-workspace senders arrive. The
 // impactrentals.store domain MUST be onboarded in Cloudflare Email Service
 // (Workers Paid) before production email can send from it.
-export const DEFAULT_FROM = "Order Desk <orders@impactrentals.store>";
+export const DEFAULT_FROM = `${APP_NAME} <orders@impactrentals.store>`;
 
 // The sender actually used: EMAIL_FROM (wrangler.jsonc vars) when set, else
 // DEFAULT_FROM. Whatever domain it names must be onboarded for Email Sending

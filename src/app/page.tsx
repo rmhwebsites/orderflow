@@ -2,8 +2,12 @@ import Link from "next/link";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { getDb } from "@/db";
+import { accentStyle } from "@/lib/accent";
+import { APP_NAME } from "@/lib/brand";
 import { getAuth } from "@/server/auth";
 import { listWorkspacesForUser } from "@/server/workspaces";
+import { ThemeToggle } from "@/components/theme-toggle";
+import { ui } from "@/components/ui";
 import { NewWorkspaceForm } from "./new-workspace-form";
 
 // Per-viewer page: never prerender it at build time, where there is no session
@@ -18,44 +22,48 @@ export default async function Home() {
   const rows = await listWorkspacesForUser(getDb(), session.user.id);
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-lg flex-col gap-8 px-6 py-12 font-sans">
-      <div>
-        <h1 className="font-display text-2xl font-semibold">Order Desk</h1>
-        <p className="mt-1 text-sm opacity-70">Signed in as {session.user.email}</p>
-      </div>
-      <section className="flex flex-col gap-3">
-        <h2 className="text-sm font-medium uppercase tracking-wide opacity-60">
+    <main className="mx-auto flex min-h-dvh max-w-xl flex-col gap-10 px-4 py-10 sm:px-6 sm:py-14">
+      <header className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="font-display text-2xl font-semibold tracking-tight">{APP_NAME}</h1>
+          <p className="mt-1 text-sm text-ink-2">Signed in as {session.user.email}</p>
+        </div>
+        <ThemeToggle />
+      </header>
+
+      <section aria-labelledby="workspaces-heading" className="flex flex-col gap-3">
+        <h2 id="workspaces-heading" className="font-display text-base font-semibold">
           Your workspaces
         </h2>
         {rows.length === 0 ? (
-          <p className="text-sm opacity-70">
-            No workspaces yet. Create one below to get started.
+          <p className={`${ui.panel} px-4 py-5 text-sm text-ink-2`}>
+            No workspaces yet. Create one below, then connect its Shopify store in Settings.
           </p>
         ) : (
           <ul className="flex flex-col gap-2">
             {rows.map((workspace) => (
-              <li key={workspace.id}>
+              <li key={workspace.id} style={accentStyle(workspace.accentColor)} data-accent-scope>
                 <Link
                   href={`/w/${workspace.slug}`}
-                  className="flex items-center gap-3 rounded-lg border border-black/10 bg-white px-4 py-3 hover:border-[var(--accent)]"
+                  className={`${ui.panel} flex items-center gap-3 px-4 py-3 transition-colors hover:border-accent-strong`}
                 >
                   <span
                     aria-hidden
-                    className="h-3 w-3 rounded-full"
-                    style={{ backgroundColor: workspace.accentColor }}
-                  />
-                  <span className="flex-1 font-medium">{workspace.name}</span>
-                  <span className="text-xs uppercase tracking-wide opacity-60">
-                    {workspace.role}
+                    className="grid size-9 shrink-0 place-items-center rounded-full bg-accent font-display text-sm font-semibold text-accent-ink"
+                  >
+                    {workspace.name.trim().charAt(0).toUpperCase()}
                   </span>
+                  <span className="flex-1 font-medium">{workspace.name}</span>
+                  <span className="text-xs font-medium capitalize text-ink-2">{workspace.role}</span>
                 </Link>
               </li>
             ))}
           </ul>
         )}
       </section>
-      <section className="flex flex-col gap-3">
-        <h2 className="text-sm font-medium uppercase tracking-wide opacity-60">
+
+      <section aria-labelledby="new-workspace-heading" className="flex flex-col gap-3">
+        <h2 id="new-workspace-heading" className="font-display text-base font-semibold">
           New workspace
         </h2>
         <NewWorkspaceForm />

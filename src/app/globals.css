@@ -1,10 +1,376 @@
 @import "tailwindcss";
 
+/*
+ * Order Desk design tokens.
+ *
+ * Bare :root is the LIGHT palette and the default for every workspace.
+ * Dark redefines only the color tokens, under :root[data-theme="dark"] and,
+ * for the "system" choice, under prefers-color-scheme: dark guarded by
+ * :root[data-theme="system"]. public/theme-init.js sets data-theme before
+ * first paint; src/components/theme-toggle.tsx changes it.
+ *
+ * Components use these tokens only (through the Tailwind theme below).
+ * Contrast (WCAG 2): ink 7:1 or better on every surface; ink-2, ink-3
+ * (placeholders included), good, warn, bad and every status text 4.5:1 or
+ * better on bg, surface, surface-2 and on their own status fill; line-strong
+ * (control borders) 3:1. src/lib/accent.ts mirrors the three surface values
+ * of each theme; change them together.
+ */
+
 @theme inline {
-  --font-sans: var(--font-red-hat-display);
-  --font-display: var(--font-sora);
-  --font-mono: var(--font-red-hat-mono);
+  --font-sans: var(--font-red-hat-display), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-sora), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-red-hat-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-strong: var(--accent-strong);
+  --color-focus: var(--focus);
+  --color-good: var(--good);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --color-tone-fill: var(--tone-fill);
+  --color-tone-text: var(--tone-text);
+  --color-scrim: var(--scrim);
 }
 
-:root { --bg: #f4f5f2; --ink: #101820; --accent: #91d500; }
-body { background: var(--bg); color: var(--ink); }
+@theme {
+  /* One radius system: interactive controls are pills (rounded-full),
+     panels and cards are 12px. */
+  --radius-panel: 12px;
+  /* The desk switches from cards to a table at 880px. */
+  --breakpoint-desk: 55rem;
+  --ease-out-soft: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+:root {
+  color-scheme: light;
+
+  --bg: #f3f4f1;
+  --surface: #fcfdfb;
+  --surface-2: #eceee9;
+  --ink: #101820;
+  --ink-2: #3b4550;
+  --ink-3: #58626c;
+  --line: #dadfd6;
+  --line-strong: #7d868f;
+
+  /* Workspace accent. These defaults are IMPACT's; the workspace shell sets
+     its own four values inline (src/lib/accent.ts). */
+  --accent: #91d500;
+  --accent-ink: #101820;
+  --accent-strong-light: #4a6d12;
+  --accent-strong-dark: #91d500;
+
+  --good: #1d6b35;
+  --warn: #7f5200;
+  --bad: #a8231a;
+
+  --scrim: rgb(16 24 32 / 0.45);
+  --shadow-tint: 210 30% 12%;
+
+  /* Status colors: a chip fill and a text-safe color per name. */
+  --st-lime-fill: #e5f4c4;
+  --st-lime-text: #395700;
+  --st-blue-fill: #dde8fa;
+  --st-blue-text: #1b4c9a;
+  --st-amber-fill: #faebc9;
+  --st-amber-text: #734b00;
+  --st-green-fill: #d6efdc;
+  --st-green-text: #1a6534;
+  --st-teal-fill: #d1eeeb;
+  --st-teal-text: #0c6059;
+  --st-violet-fill: #ebe3fa;
+  --st-violet-text: #5631a0;
+  --st-red-fill: #fadcd8;
+  --st-red-text: #9e2219;
+  --st-slate-fill: #e2e6ea;
+  --st-slate-text: #3a4550;
+  --st-pink-fill: #f8dce9;
+  --st-pink-text: #951d57;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0c1116;
+  --surface: #121920;
+  --surface-2: #1a232c;
+  --ink: #eef1ec;
+  --ink-2: #b8c0c8;
+  --ink-3: #8e98a2;
+  --line: #25303a;
+  --line-strong: #66717c;
+
+  --good: #7fd49a;
+  --warn: #f0c46a;
+  --bad: #f4a199;
+
+  --scrim: rgb(0 0 0 / 0.6);
+  --shadow-tint: 210 40% 2%;
+
+  --st-lime-fill: #22310b;
+  --st-lime-text: #b6e46a;
+  --st-blue-fill: #15294a;
+  --st-blue-text: #a0c4f5;
+  --st-amber-fill: #382a0c;
+  --st-amber-text: #f0c66c;
+  --st-green-fill: #13311f;
+  --st-green-text: #89d8a2;
+  --st-teal-fill: #0f2f2d;
+  --st-teal-text: #80d5ce;
+  --st-violet-fill: #291f44;
+  --st-violet-text: #c8b4f5;
+  --st-red-fill: #3b1816;
+  --st-red-text: #f5a79f;
+  --st-slate-fill: #222a32;
+  --st-slate-text: #bcc6cf;
+  --st-pink-fill: #3a1629;
+  --st-pink-text: #f3a8ca;
+}
+
+:root[data-theme="system"] {
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    --bg: #0c1116;
+    --surface: #121920;
+    --surface-2: #1a232c;
+    --ink: #eef1ec;
+    --ink-2: #b8c0c8;
+    --ink-3: #8e98a2;
+    --line: #25303a;
+    --line-strong: #66717c;
+
+    --good: #7fd49a;
+    --warn: #f0c46a;
+    --bad: #f4a199;
+
+    --scrim: rgb(0 0 0 / 0.6);
+    --shadow-tint: 210 40% 2%;
+
+    --st-lime-fill: #22310b;
+    --st-lime-text: #b6e46a;
+    --st-blue-fill: #15294a;
+    --st-blue-text: #a0c4f5;
+    --st-amber-fill: #382a0c;
+    --st-amber-text: #f0c66c;
+    --st-green-fill: #13311f;
+    --st-green-text: #89d8a2;
+    --st-teal-fill: #0f2f2d;
+    --st-teal-text: #80d5ce;
+    --st-violet-fill: #291f44;
+    --st-violet-text: #c8b4f5;
+    --st-red-fill: #3b1816;
+    --st-red-text: #f5a79f;
+    --st-slate-fill: #222a32;
+    --st-slate-text: #bcc6cf;
+    --st-pink-fill: #3a1629;
+    --st-pink-text: #f3a8ca;
+  }
+}
+
+/*
+ * Accent strength per theme. Declared on :root and again on the workspace
+ * shell ([data-accent-scope], which sets its own --accent-strong-light and
+ * --accent-strong-dark inline): a custom property that references another
+ * resolves where it is declared, so the scope has to re-declare it.
+ */
+:root,
+[data-accent-scope] {
+  --accent-strong: var(--accent-strong-light);
+  --focus: var(--accent-strong);
+}
+
+:root[data-theme="dark"],
+:root[data-theme="dark"] [data-accent-scope] {
+  --accent-strong: var(--accent-strong-dark);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"],
+  :root[data-theme="system"] [data-accent-scope] {
+    --accent-strong: var(--accent-strong-dark);
+  }
+}
+
+/* Status tones: data-tone="<color name>" picks a fill and its text color.
+   Unknown names fall back to slate. */
+[data-tone] {
+  --tone-fill: var(--st-slate-fill);
+  --tone-text: var(--st-slate-text);
+}
+[data-tone="lime"] {
+  --tone-fill: var(--st-lime-fill);
+  --tone-text: var(--st-lime-text);
+}
+[data-tone="blue"] {
+  --tone-fill: var(--st-blue-fill);
+  --tone-text: var(--st-blue-text);
+}
+[data-tone="amber"] {
+  --tone-fill: var(--st-amber-fill);
+  --tone-text: var(--st-amber-text);
+}
+[data-tone="green"] {
+  --tone-fill: var(--st-green-fill);
+  --tone-text: var(--st-green-text);
+}
+[data-tone="teal"] {
+  --tone-fill: var(--st-teal-fill);
+  --tone-text: var(--st-teal-text);
+}
+[data-tone="violet"] {
+  --tone-fill: var(--st-violet-fill);
+  --tone-text: var(--st-violet-text);
+}
+[data-tone="red"] {
+  --tone-fill: var(--st-red-fill);
+  --tone-text: var(--st-red-text);
+}
+[data-tone="pink"] {
+  --tone-fill: var(--st-pink-fill);
+  --tone-text: var(--st-pink-text);
+}
+
+html {
+  background: var(--bg);
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 40%, transparent);
+  color: var(--ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+::placeholder {
+  color: var(--ink-3);
+  opacity: 1;
+}
+
+/* Shadows tinted to the page hue, never pure black. */
+.shadow-panel {
+  box-shadow:
+    0 1px 2px hsl(var(--shadow-tint) / 0.06),
+    0 8px 24px -12px hsl(var(--shadow-tint) / 0.18);
+}
+.shadow-lift {
+  box-shadow:
+    0 2px 6px hsl(var(--shadow-tint) / 0.1),
+    0 24px 48px -16px hsl(var(--shadow-tint) / 0.32);
+}
+
+/*
+ * Motion. Motivated only (loading pulse, live-change flash, toast entry,
+ * drawer slide, sync spinner), transform and opacity only, custom easing,
+ * and nothing moves under prefers-reduced-motion: reduce.
+ */
+@keyframes od-pulse {
+  50% {
+    opacity: 0.5;
+  }
+}
+@keyframes od-flash-fade {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+@keyframes od-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes od-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.od-skeleton {
+  background: var(--surface-2);
+  border-radius: 9999px;
+}
+
+/* Live-change flash: an accent wash over a row cell or card that fades. */
+.od-flash {
+  position: relative;
+}
+.od-flash::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  opacity: 0;
+}
+
+.od-drawer-scrim {
+  opacity: 0;
+}
+.od-drawer-panel {
+  transform: translateX(100%);
+}
+[data-drawer-state="open"] .od-drawer-scrim {
+  opacity: 1;
+}
+[data-drawer-state="open"] .od-drawer-panel {
+  transform: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .od-skeleton {
+    animation: od-pulse 1.6s ease-in-out infinite;
+  }
+  .od-flash::after {
+    animation: od-flash-fade 1.8s var(--ease-out-soft) both;
+  }
+  .od-rise {
+    animation: od-rise 0.24s var(--ease-out-soft) both;
+  }
+  .od-spin {
+    animation: od-spin 0.9s linear infinite;
+  }
+  .od-drawer-scrim {
+    transition: opacity 0.2s var(--ease-out-soft);
+  }
+  .od-drawer-panel {
+    transition: transform 0.28s var(--ease-out-soft);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .od-flash::after {
+    display: none;
+  }
+}

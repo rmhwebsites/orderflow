@@ -2,6 +2,7 @@ import { and, eq } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { pendingInvites, user, workspaceMembers, workspaces } from "@/db/schema";
+import { APP_NAME } from "@/lib/brand";
 import { escapeHtml, sanitizeSubject } from "@/server/email/escape";
 import { defaultFrom, sendEmail } from "@/server/email/send";
 import { AuthError, guardResponse, requireMember, roleAtLeast } from "@/server/guard";
@@ -112,12 +113,12 @@ export async function POST(request: Request, context: RouteContext) {
     await sendEmail(env, {
       from: defaultFrom(env),
       to: [email],
-      subject: `You have been added to ${sanitizeSubject(workspaceName)} on Order Desk`,
+      subject: `You have been added to ${sanitizeSubject(workspaceName)} on ${APP_NAME}`,
       html: [
         '<div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 24px;">',
         `<h1 style="font-size: 20px; color: #101820;">You have been added to ${safeName}</h1>`,
         '<p style="color: #101820;">Sign in with this email address to start managing orders.</p>',
-        `<p><a href="${env.APP_URL}" style="display: inline-block; background: #91d500; color: #101820; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">Open Order Desk</a></p>`,
+        `<p><a href="${env.APP_URL}" style="display: inline-block; background: #91d500; color: #101820; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">Open ${escapeHtml(APP_NAME)}</a></p>`,
         "</div>",
       ].join(""),
     });
