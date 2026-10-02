@@ -269,3 +269,93 @@ export async function fetchOrdersUpdatedSince(
   // (hundreds of orders sharing one second) cannot livelock the sync.
   return truncatedAt(cursor);
 }
+
+// The same host allowlist the sync uses, for callers that normalize a shop
+// domain before storing it (the connection settings route).
+export function isValidShopDomain(domain: string): boolean {
+  return SHOP_DOMAIN.test(domain);
+}
+
+export type ShopConnectionResult =
+  | { kind: "ok"; shopName: string }
+  | { kind: "auth" }
+  | { kind: "transient"; detail: string }
+  | { kind: "fatal"; detail: string };
+
+// An owner waits on this while saving the connection, so it gets a much
+// shorter budget than the sync's page requests.
+const CONNECTION_TEST_TIMEOUT_MS = 15000;
+
+const SHOP_NAME_QUERY = "{ shop { name } }";
+
+// Verifies a domain and token pair with the cheapest possible query before
+// the token is stored. Same protections as fetchOrdersUpdatedSince: the host
+// is checked against the allowlist before any request, redirects are never
+// followed (they would re-send the token), the request has a timeout, and no
+// detail string ever contains the token. Never throws.
+export async function testShopConnection(
+  shopDomain: string,
+  token: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<ShopConnectionResult> {
+  if (!SHOP_DOMAIN.test(shopDomain)) {
+    return { kind: "fatal", detail: "invalid shop domain" };
+  }
+
+  let response: Response;
+  try {
+    response = await fetchImpl(
+      `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+      {
+        method: "POST",
+        headers: {
+          "X-Shopify-Access-Token": token,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ query: SHOP_NAME_QUERY }),
+        redirect: "manual",
+        signal: AbortSignal.timeout(CONNECTION_TEST_TIMEOUT_MS),
+      },
+    );
+  } catch (e) {
+    const name = typeof e === "object" && e !== null ? (e as { name?: unknown }).name : undefined;
+    if (name === "TimeoutError" || name === "AbortError") {
+      return { kind: "transient", detail: "Shopify request timed out" };
+    }
+    const message = e instanceof Error ? e.message : "fetch threw";
+    return { kind: "transient", detail: scrub(`network error: ${message}`, token) };
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    return { kind: "auth" };
+  }
+  if (response.status < 200 || response.status >= 300) {
+    return { kind: "transient", detail: `Shopify responded with HTTP ${response.status}` };
+  }
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return { kind: "transient", detail: "Shopify returned invalid JSON" };
+  }
+
+  const errors = isRecord(body) ? body.errors : undefined;
+  if (Array.isArray(errors) && errors.length > 0) {
+    if (isThrottled(errors)) {
+      return { kind: "transient", detail: "Shopify throttled the request" };
+    }
+    const first = errors[0] as { message?: unknown } | null;
+    const message =
+      typeof first?.message === "string" ? first.message : "Shopify returned a GraphQL error";
+    return { kind: "fatal", detail: scrub(message, token) };
+  }
+
+  const shop = isRecord(body) && isRecord(body.data) ? body.data.shop : undefined;
+  if (!isRecord(shop) || typeof shop.name !== "string") {
+    return { kind: "transient", detail: "unexpected response shape" };
+  }
+  // The name goes back to the browser; scrubbed like every other string
+  // that originated outside this worker.
+  return { kind: "ok", shopName: scrub(shop.name, token) };
+}
