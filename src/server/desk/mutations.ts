@@ -7,10 +7,11 @@ import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@/db";
 import { applyBatch, rowsAffected } from "@/db/batch";
 import { events, orders, statuses } from "@/db/schema";
+import { NOTE_MAX } from "@/lib/limits";
 import { eventView, isRecord, type EventView } from "./shapes";
 
-// Matches the 4000 a note textarea's maxLength counts (UTF-16 code units).
-export const NOTE_MAX = 4000;
+// Shared with the note composer (src/lib/limits.ts).
+export { NOTE_MAX };
 
 export type MutationContext = {
   workspaceId: string;
