@@ -1,0 +1,66 @@
+// Response shapes shared by the desk services and API routes. Phase 5 builds
+// the desk UI against these, so change them deliberately.
+
+import type { events, statuses, workspaceSettings } from "@/db/schema";
+
+export type StatusView = {
+  key: string;
+  label: string;
+  color: string;
+  sort: number;
+  triggersPo: boolean;
+};
+
+export type EventView = {
+  id: string;
+  orderId: string | null;
+  type: (typeof events.$inferSelect)["type"];
+  text: string;
+  actorId: string | null;
+  meta: unknown;
+  createdAt: number;
+};
+
+export type SettingsView = {
+  notificationEmails: string[];
+  poPrefix: string;
+  replyTo: string | null;
+  fromName: string | null;
+};
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function statusView(row: typeof statuses.$inferSelect): StatusView {
+  return {
+    key: row.key,
+    label: row.label,
+    color: row.color,
+    sort: row.sort,
+    triggersPo: row.triggersPo,
+  };
+}
+
+export function eventView(row: typeof events.$inferSelect): EventView {
+  return {
+    id: row.id,
+    orderId: row.orderId,
+    type: row.type,
+    text: row.text,
+    actorId: row.actorId,
+    meta: row.meta ?? null,
+    createdAt: row.createdAt,
+  };
+}
+
+// Every workspace gets a settings row at creation; the defaults (the column
+// defaults) only cover a row that is missing anyway.
+export function settingsView(row: typeof workspaceSettings.$inferSelect | undefined): SettingsView {
+  return {
+    notificationEmails: Array.isArray(row?.notificationEmails) ? row.notificationEmails : [],
+    poPrefix: row?.poPrefix ?? "PO",
+    replyTo: row?.replyTo ?? null,
+    fromName: row?.fromName ?? null,
+  };
+}

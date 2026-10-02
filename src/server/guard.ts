@@ -2,8 +2,8 @@ import { cache } from "react";
 import { and, eq } from "drizzle-orm";
 import { headers } from "next/headers";
 import { NextResponse } from "next/server";
-import { getDb } from "@/db";
-import { workspaceMembers, workspaces } from "@/db/schema";
+import { getDb, type Db } from "@/db";
+import { orders, workspaceMembers, workspaces } from "@/db/schema";
 import { getAuth } from "./auth";
 
 export type Role = "owner" | "admin" | "member";
@@ -34,12 +34,14 @@ export async function requireSession() {
   return { userId: session.user.id, db: getDb(), session };
 }
 
-// Membership guard for workspace-scoped routes. 401 without a session; 404
-// both when the workspace has no membership for the user and when the role is
-// under-ranked, so a non-member cannot distinguish "exists but forbidden"
-// from "does not exist".
-export async function requireMember(workspaceId: string, required: Role) {
-  const { userId, db, session } = await requireSession();
+// The caller's role in the workspace, or a 404 when there is no membership
+// or the role is under-ranked.
+async function memberRole(
+  db: Db,
+  workspaceId: string,
+  userId: string,
+  required: Role,
+): Promise<Role> {
   const rows = await db
     .select()
     .from(workspaceMembers)
@@ -54,7 +56,36 @@ export async function requireMember(workspaceId: string, required: Role) {
   if (!membership || !roleAtLeast(membership.role, required)) {
     throw new AuthError(404, "Not found");
   }
-  return { userId, role: membership.role, db, session };
+  return membership.role;
+}
+
+// Membership guard for workspace-scoped routes. 401 without a session; 404
+// both when the workspace has no membership for the user and when the role is
+// under-ranked, so a non-member cannot distinguish "exists but forbidden"
+// from "does not exist".
+export async function requireMember(workspaceId: string, required: Role) {
+  const { userId, db, session } = await requireSession();
+  const role = await memberRole(db, workspaceId, userId, required);
+  return { userId, role, db, session };
+}
+
+// Guard for order-scoped routes (/api/orders/[orderId]/...): resolves the
+// order's workspace, then applies the membership rule above. A missing order
+// and a non-member (or under-ranked) caller get the same 404, so order ids
+// reveal nothing to outsiders. 401 without a session comes first.
+export async function requireMemberByOrder(orderId: string, required: Role) {
+  const { userId, db, session } = await requireSession();
+  const rows = await db
+    .select({ workspaceId: orders.workspaceId })
+    .from(orders)
+    .where(eq(orders.id, orderId))
+    .limit(1);
+  const order = rows[0];
+  if (!order) {
+    throw new AuthError(404, "Not found");
+  }
+  const role = await memberRole(db, order.workspaceId, userId, required);
+  return { userId, role, db, session, workspaceId: order.workspaceId };
 }
 
 // Guard for /w/[slug] server components. EVERY server component under
